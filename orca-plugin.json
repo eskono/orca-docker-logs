@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "docker-logs",
   "name": "Docker Logs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Logs of the focused project's Docker Compose containers, with start, stop, restart and clear.",
   "author": {
     "name": "Maksim Shevchuk"

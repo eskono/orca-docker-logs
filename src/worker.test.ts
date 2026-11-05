@@ -17,6 +17,7 @@ case "$1 $2" in
   logs*)
     printf '2026-01-01T00:00:01.000000000Z out one\\n2026-01-01T00:00:03.000000000Z out two\\n'
     printf '2026-01-01T00:00:02.000000000Z err one\\n' >&2 ;;
+  stats*) printf '{"ID":"${APP}","CPUPerc":"1.50%%","MemUsage":"10MiB / 1GiB","MemPerc":"0.98%%"}\\n' ;;
   start*|stop*|restart*) echo "$2" ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac
@@ -96,6 +97,16 @@ test('merges log streams and hides lines before a clear', async () => {
   assert.deepEqual(await worker.request('logs.clear', { path: project, service: 'app', reset: true }), { clearedAt: null })
   await worker.request('logs.get', input)
   assert.equal((await calls()).at(-1)?.split('|')[1], `logs --timestamps --tail 1000 ${APP}`)
+  await worker.deactivate()
+})
+
+test('samples CPU and memory of the given containers only', async () => {
+  const { worker, project, calls } = await setup()
+  assert.deepEqual(await worker.request('stats.get', { path: project, containerIds: [] }), { stats: {} })
+  const { stats } = await worker.request('stats.get', { path: project, containerIds: [APP] })
+  assert.deepEqual(stats, { [APP]: { cpu: '1.50%', mem: '10MiB', memLimit: '1GiB', memPercent: '0.98%' } })
+  assert.deepEqual((await calls()).map((c) => c.split('|')[1]), [`stats --no-stream --no-trunc --format {{json .}} ${APP}`])
+  await assert.rejects(worker.request('stats.get', { path: project, containerIds: ['--all'] }), { code: 'invalid_params' })
   await worker.deactivate()
 })
 

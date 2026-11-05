@@ -1,5 +1,5 @@
 // The panel: compose services of the chosen project, their state and actions, and one container's log.
-import type { FocusContext, LogLine, Requests, ServiceAction, ServiceRow, Workspace } from '../src/protocol'
+import type { ContainerStats, FocusContext, LogLine, Requests, ServiceAction, ServiceRow, Workspace } from '../src/protocol'
 import { parseAnsi, stripAnsi, type Style } from './ansi'
 
 type Orca = {
@@ -53,7 +53,9 @@ const state = {
   truncated: false,
   notice: null as { text: string; error: boolean } | null,
   logError: null as string | null,
-  busy: new Set<string>()
+  busy: new Set<string>(),
+  /** CPU and memory of running containers by container id, from the last `stats.get`. */
+  stats: {} as Record<string, ContainerStats>
 }
 /** The service last viewed in each project, picked again when the project comes back. */
 const lastService = new Map<string, string>()
@@ -61,6 +63,7 @@ const lastService = new Map<string, string>()
 let generation = 0
 let servicesInFlight = false
 let logsInFlight = false
+let statsInFlight = false
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error))
 const selectedRow = () => state.rows.find((r) => r.key === state.key) ?? null
@@ -133,12 +136,15 @@ function renderServices(): void {
     const item = el('li', selected ? 'service selected' : 'service')
     const pick = el('button', 'pick')
     pick.setAttribute('aria-pressed', String(selected))
+    const usage = row.containerId && row.state === 'running' ? state.stats[row.containerId] : undefined
     pick.title = `${row.name}\n${row.status}`
+    if (usage) pick.title += `\nCPU ${usage.cpu}\nMemory ${usage.mem} / ${usage.memLimit} (${usage.memPercent})`
     pick.append(
       el('span', `dot ${tone(row)}`),
       el('span', 'name', (replicas.get(row.service) ?? 0) > 1 ? row.name : row.service),
       el('span', 'status', state.busy.has(row.key) ? 'Working…' : row.status)
     )
+    if (usage) pick.append(el('span', 'usage', `${usage.cpu} ${usage.mem}`))
     pick.addEventListener('click', () => selectRow(row))
     const actions = el('span', 'actions')
     for (const action of rowActions(row)) {
@@ -272,6 +278,7 @@ function setPath(path: string | null): void {
   state.lines = []
   state.clearedAt = null
   state.logError = null
+  state.stats = {}
   generation++
   renderWorkspaces()
   renderServices()
@@ -299,7 +306,9 @@ async function loadServices(): Promise<void> {
     const { rows } = await orca.plugin.request('services.list', { path })
     if (at !== generation) return
     state.rows = rows
+    const firstLoad = !state.servicesLoaded
     state.servicesLoaded = true
+    if (firstLoad) void loadStats()
     if (state.notice?.error) setNotice(null)
     const row = pickRow(rows)
     if (row && row.key !== state.key) selectRow(row)
@@ -315,6 +324,29 @@ async function loadServices(): Promise<void> {
   } finally {
     servicesInFlight = false
   }
+}
+
+/** Best effort: a failed sample (a container that just stopped, say) leaves the numbers out until the next. */
+async function loadStats(): Promise<void> {
+  const path = state.path
+  const containerIds = state.rows.flatMap((r) => (r.containerId && r.state === 'running' ? [r.containerId] : []))
+  if (!path || statsInFlight) return
+  if (!containerIds.length) {
+    state.stats = {}
+    return
+  }
+  statsInFlight = true
+  try {
+    const { stats } = await orca.plugin.request('stats.get', { path, containerIds }, { timeoutMs: 45_000 })
+    if (path !== state.path) return
+    state.stats = stats
+  } catch {
+    if (path !== state.path) return
+    state.stats = {}
+  } finally {
+    statsInFlight = false
+  }
+  renderServices()
 }
 
 function selectRow(row: ServiceRow): void {
@@ -442,7 +474,9 @@ setInterval(() => {
   if (!document.hidden && els.follow.checked) void loadLogs()
 }, LOG_POLL_MS)
 setInterval(() => {
-  if (!document.hidden) void loadServices()
+  if (document.hidden) return
+  void loadServices()
+  void loadStats()
 }, SERVICES_POLL_MS)
 
 renderWorkspaces()

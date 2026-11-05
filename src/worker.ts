@@ -1,7 +1,7 @@
 // The plugin's worker: answers panel requests by running the docker CLI in a workspace folder.
 import { createHash } from 'node:crypto'
 import type { OrcaWorkerApi } from 'orca/worker'
-import { buildRows, fail, findDocker, mergeLogs, newestWithin, parsePs, parseServices, run } from './docker'
+import { buildRows, fail, findDocker, mergeLogs, newestWithin, parsePs, parseServices, parseStats, run } from './docker'
 import type { Requests, ServiceAction } from './protocol'
 import { hasComposeFile, localOnly, resolveFocused, type ListedWorkspace } from './workspaces'
 
@@ -12,6 +12,8 @@ const ACTIONS: readonly ServiceAction[] = ['start', 'stop', 'restart']
 const CONTAINER_ID = /^[0-9a-f]{12,64}$/
 const SERVICE_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/
 const WORKSPACES_TTL_MS = 10_000
+/** More containers than one project plausibly runs; keeps the docker command line bounded. */
+const MAX_STATS_CONTAINERS = 200
 
 type Handler<K extends keyof Requests> = (input: Requests[K]['input']) => Promise<Requests[K]['output']>
 
@@ -69,6 +71,17 @@ export default function activate(orca: OrcaWorkerApi): void {
         run(bin, ['compose', 'ps', '--all', '--format', 'json'], { cwd: path, timeoutMs: 20_000 })
       ])
       return { rows: buildRows(parseServices(config.stdout), parsePs(ps.stdout)) }
+    },
+
+    'stats.get': async (input) => {
+      await checkPath(input.path)
+      const ids = Array.isArray(input.containerIds) ? input.containerIds.map(checkContainer) : []
+      if (ids.length > MAX_STATS_CONTAINERS) throw fail('invalid_params', 'Too many containers')
+      if (ids.length === 0) return { stats: {} }
+      // --no-stream samples twice about a second apart to work out CPU, so this takes a while.
+      const args = ['stats', '--no-stream', '--no-trunc', '--format', '{{json .}}', ...ids]
+      const { stdout } = await run(await docker(), args, { timeoutMs: 30_000 })
+      return { stats: parseStats(stdout) }
     },
 
     'logs.get': async (input) => {

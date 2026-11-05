@@ -26,6 +26,9 @@ export type ServiceRow = {
   health: string
 }
 
+/** Resource use of a running container, as `docker stats` prints it (`3.34%`, `323.5MiB`, ...). */
+export type ContainerStats = { cpu: string; mem: string; memLimit: string; memPercent: string }
+
 /** One log line: docker timestamp (RFC 3339, UTC), whether it came from stderr, the message. */
 export type LogLine = { t: string; e: boolean; m: string }
 
@@ -39,6 +42,11 @@ export type Requests = {
   }
   /** Compose services of a workspace with their containers' state. */
   'services.list': { input: { path: string }; output: { rows: ServiceRow[] } }
+  /** CPU and memory of running containers, keyed by container id. Takes a couple of seconds. */
+  'stats.get': {
+    input: { path: string; containerIds: string[] }
+    output: { stats: Record<string, ContainerStats> }
+  }
   /** The newest log lines of a container, after the service's "cleared" mark if any. */
   'logs.get': {
     input: { path: string; service: string; containerId: string }

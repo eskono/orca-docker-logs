@@ -1,5 +1,5 @@
 import { assert, test } from 'orca/testing'
-import { buildRows, mergeLogs, newestWithin, parsePs, parseServices } from './docker'
+import { buildRows, mergeLogs, newestWithin, parsePs, parseServices, parseStats } from './docker'
 
 const app = { ID: 'a'.repeat(64), Name: 'proj-app-1', Service: 'app', State: 'running', Status: 'Up 2 minutes (healthy)', Health: 'healthy' }
 const db = { ID: 'b'.repeat(64), Name: 'proj-db-1', Service: 'db', State: 'exited', Status: 'Exited (1) 5 seconds ago', Health: '' }
@@ -48,4 +48,12 @@ test('keeps the newest lines that fit the answer budget', () => {
   const huge = newestWithin([{ t: 'x', e: false, m: 'y'.repeat(10_000) }], 800)
   assert.equal(huge.truncated, true)
   assert.equal(huge.lines[0].m.length, 100)
+})
+
+test('reads docker stats lines keyed by full container id', () => {
+  const line = { ID: app.ID, Container: app.ID, Name: app.Name, CPUPerc: '3.34%', MemUsage: '323.5MiB / 11.68GiB', MemPerc: '2.70%' }
+  assert.deepEqual(parseStats(`${JSON.stringify(line)}\n\n`), {
+    [app.ID]: { cpu: '3.34%', mem: '323.5MiB', memLimit: '11.68GiB', memPercent: '2.70%' }
+  })
+  assert.deepEqual(parseStats(''), {})
 })

@@ -12,6 +12,8 @@ It runs its own worker (it calls the `docker` CLI), so Orca asks you to approve 
   `COMPOSE_FILE` from the project's `.env`. Services without a container yet are listed too.
 - **The project follows Orca's focus.** The panel switches when you focus another workspace; the
   picker at the top lists every local workspace with a compose file, to look at another one.
+- **CPU and memory** of each running container from `docker stats`, refreshed every 5 seconds
+  (one sample takes Docker about two seconds); hover a row for the memory limit.
 - **Actions.** ▶ starts a stopped container (`docker start`) or creates a missing one
   (`docker compose up -d <service>`, which may build or pull first); ■ stops, ↻ restarts.
 - **Clear** hides everything logged so far for that service (it remembers the time and asks

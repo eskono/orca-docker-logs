@@ -4,7 +4,7 @@ import { constants } from 'node:fs'
 import { access } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join } from 'node:path'
-import type { LogLine, ServiceRow } from './protocol'
+import type { ContainerStats, LogLine, ServiceRow } from './protocol'
 
 /** An Error carrying a `code`, which Orca hands to the panel's `plugin.request` rejection. */
 export function fail(code: string, message: string): Error {
@@ -138,7 +138,20 @@ export function buildRows(services: string[], containers: PsEntry[]): ServiceRow
   })
 }
 
-const TIMESTAMPED = /^(\d{4}-\d\d-\d\dT\S+) ?(.*)$/s
+/** `docker stats --no-stream --no-trunc --format '{{json .}}'`: one object per line. */
+export function parseStats(stdout: string): Record<string, ContainerStats> {
+  const stats: Record<string, ContainerStats> = {}
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue
+    const entry = JSON.parse(line) as { ID?: unknown; CPUPerc?: unknown; MemUsage?: unknown; MemPerc?: unknown }
+    if (typeof entry.ID !== 'string') continue
+    const [mem = '', memLimit = ''] = String(entry.MemUsage ?? '').split(' / ')
+    stats[entry.ID] = { cpu: String(entry.CPUPerc ?? ''), mem, memLimit, memPercent: String(entry.MemPerc ?? '') }
+  }
+  return stats
+}
+
+const TIMESTAMPED =/^(\d{4}-\d\d-\d\dT\S+) ?(.*)$/s
 
 function parseStream(text: string, fromStderr: boolean): LogLine[] {
   const lines = text.split('\n')
