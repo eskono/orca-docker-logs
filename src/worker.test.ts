@@ -49,6 +49,12 @@ case "$*" in
 esac
 `
 
+/** Stands in for the `orca` CLI the worker calls to switch to the terminals it opens. */
+const FAKE_ORCA = `#!/bin/sh
+echo "$*" >> "$(dirname "$0")/orca.log"
+echo '{"ok":true,"result":{}}'
+`
+
 async function setup() {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'docker-logs-test-')))
   const project = join(root, 'project')
@@ -62,6 +68,10 @@ async function setup() {
     writeFile(docker, FAKE_DOCKER)
   ])
   await chmod(docker, 0o755)
+  await mkdir(join(root, 'bin'))
+  await writeFile(join(root, 'bin', 'orca'), FAKE_ORCA)
+  await chmod(join(root, 'bin', 'orca'), 0o755)
+  process.env.PATH = `${join(root, 'bin')}:${process.env.PATH}`
   const host = mockHost({
     settings: { dockerPath: docker, agent: 'codex' },
     results: {
@@ -83,7 +93,8 @@ async function setup() {
   const worker = await mountWorker(main, { host })
   const calls = async () => (await readFile(join(root, 'calls.log'), 'utf8').catch(() => '')).trim().split('\n').filter(Boolean)
   const args = async () => (await calls()).map((c) => c.split('|')[1])
-  return { worker, host, project, plain, docker, calls, args }
+  const orcaCalls = async () => (await readFile(join(root, 'bin', 'orca.log'), 'utf8').catch(() => '')).trim().split('\n').filter(Boolean)
+  return { worker, host, project, plain, docker, calls, args, orcaCalls }
 }
 
 test('lists compose workspaces and resolves the focused one', async () => {
@@ -157,7 +168,7 @@ test('samples CPU and memory of the given containers only', async () => {
 })
 
 test('acts on containers in the background and opens terminals for long compose commands', async () => {
-  const { worker, host, project, docker, args } = await setup()
+  const { worker, host, project, docker, args, orcaCalls } = await setup()
   assert.deepEqual(
     await worker.request('service.action', { path: project, service: 'app', containerId: APP, action: 'restart' }),
     { terminalId: null }
@@ -189,13 +200,16 @@ test('acts on containers in the background and opens terminals for long compose 
     ]
   )
 
+  // Orca opens them in the background; the worker brings each to the front.
+  assert.deepEqual(await orcaCalls(), Array(4).fill('terminal switch --terminal term_1 --json'))
+
   assert.deepEqual(await worker.request('project.action', { path: project, action: 'down' }), { terminalId: null })
   assert.equal((await args()).at(-1), 'compose --profile web down')
   await worker.deactivate()
 })
 
 test('asks the configured agent about the log lines in a fence they cannot break', async () => {
-  const { worker, host, project } = await setup()
+  const { worker, host, project, orcaCalls } = await setup()
   const answer = await worker.request('agent.ask', {
     path: project,
     source: 'container "proj-worker-1"',
@@ -207,6 +221,7 @@ test('asks the configured agent about the log lines in a fence they cannot break
   assert.equal(params.agent, 'codex')
   assert.match(params.prompt, /container "proj-worker-1"/)
   assert.ok(params.prompt.endsWith('````text\n09:00:01 ok\n09:00:02 ERROR ```boom```\n````'))
+  assert.deepEqual(await orcaCalls(), ['terminal switch --terminal term_2 --json'])
   await assert.rejects(worker.request('agent.ask', { path: project, source: 'x', lines: [] }), { code: 'invalid_params' })
   await worker.deactivate()
 })

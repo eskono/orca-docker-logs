@@ -163,6 +163,11 @@
       .line.lvl-warn { border-left-color: var(--warn); background: color-mix(in srgb, var(--warn) 9%, transparent); }
       .line.lvl-error { border-left-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
       .ts { color: var(--orca-muted-foreground); user-select: none; }
+      .level-word { font-weight: 600; }
+      .level-word.debug { color: var(--orca-muted-foreground); }
+      .level-word.info { color: var(--ansi-2); }
+      .level-word.warn { color: var(--ansi-3); }
+      .level-word.error { color: var(--ansi-1); }
       .src { font-weight: 600; }
       .placeholder { padding: 4px 8px; color: var(--orca-muted-foreground); font-family: system-ui, sans-serif; white-space: normal; }
       .b { font-weight: 700; } .d { opacity: 0.7; } .i { font-style: italic; } .u { text-decoration: underline; }

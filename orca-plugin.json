@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "docker-logs",
   "name": "Docker Logs",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "See your Docker Compose containers in Orca: live logs with error highlighting, CPU and memory, ports, start/stop/rebuild, a shell, and one click to hand a failing log to your agent.",
   "author": {
     "name": "Maksim Shevchuk"

@@ -1,5 +1,5 @@
 import { assert, test } from 'orca/testing'
-import { levelOf, levels } from './levels'
+import { levelOf, levels, levelToken } from './levels'
 
 test('finds error and warning lines in common formats', () => {
   for (const line of [
@@ -36,4 +36,19 @@ test('indented lines after an error share its level', () => {
     ]),
     [null, 'error', 'error', 'error', 'error', null, null]
   )
+})
+
+test('finds the level word to colour', () => {
+  const at = (text: string) => {
+    const token = levelToken(text)
+    return token && [text.slice(token.start, token.end), token.tone]
+  }
+  assert.deepEqual(at('INFO:     127.0.0.1:52548 - "GET /api/health HTTP/1.1" 200 OK'), ['INFO', 'info'])
+  assert.deepEqual(at('2026-11-05 07:31:17.867 UTC [35208] ERROR:  duplicate key'), ['ERROR', 'error'])
+  assert.deepEqual(at('time="2026/10/20 07:44:50" level=error msg="[smtpd] 500"'), ['error', 'error'])
+  assert.deepEqual(at('{"event": "outbox dispatched", "level": "info", "timestamp": "x"}'), ['info', 'info'])
+  assert.deepEqual(at('{"level":"warn","msg":"HTTP/2 skipped"}'), ['warn', 'warn'])
+  assert.deepEqual(at('DEBUG 2026 cache miss'), ['DEBUG', 'debug'])
+  assert.equal(at('LOG:  checkpoint starting: time'), null)
+  assert.equal(at('just some info about errors'), null)
 })

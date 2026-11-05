@@ -18,6 +18,7 @@ import {
   type ComposeConfig
 } from './docker'
 import type { FocusContext, ProjectAction, Requests, ServiceAction, ServiceRow, Workspace } from './protocol'
+import { revealTerminal } from './orca-cli'
 import { ProblemTracker, summarize } from './status'
 import { hasComposeFile, localOnly, resolveFocused, type ListedWorkspace } from './workspaces'
 
@@ -144,13 +145,23 @@ export default function activate(orca: OrcaWorkerApi): void {
     return { project: config.name, rows: buildRows(config, containers) }
   }
 
-  /** Runs docker in a new Orca terminal of the workspace, for commands whose output is worth watching. */
+  /** Brings a terminal the plugin opened to the front; the terminal still works if this fails. */
+  async function reveal(terminalId: string): Promise<void> {
+    const problem = await revealTerminal(terminalId)
+    if (problem) orca.log(`could not switch to terminal ${terminalId}: ${problem}`)
+  }
+
+  /**
+   * Runs docker in a new Orca terminal of the workspace, for commands whose output is worth
+   * watching, and switches to it (Orca opens it in the background).
+   */
   async function openTerminal(path: string, title: string, args: string[]): Promise<string> {
     const workspace = await workspaceFor(path)
     const command = `cd ${shellQuote(workspace.path)} && ${[await docker(), ...args].map(shellQuote).join(' ')}`
     const { terminalId } = (await orca.host.call('terminal.create', { workspaceId: workspace.id, title, command })) as {
       terminalId: string
     }
+    await reveal(terminalId)
     return terminalId
   }
 
@@ -268,6 +279,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       const { terminalId } = (await orca.host.call('agent.launch', { workspaceId: workspace.id, agent, prompt })) as {
         terminalId: string
       }
+      await reveal(terminalId)
       return { terminalId, agent }
     }
   }

@@ -14,7 +14,7 @@ import type {
 import { problemOf } from '../src/status'
 import { parseAnsi, stripAnsi, type Style } from './ansi'
 import { icon, type IconName } from './icons'
-import { levels, type Level } from './levels'
+import { levels, levelToken, type Level } from './levels'
 
 type Orca = {
   on(event: 'workspace.changed', handler: (payload: { context: FocusContext }) => void): unknown
@@ -349,7 +349,20 @@ function renderLine({ line, level }: Shown, withTime: boolean, sourceWidth: numb
   const node = el('div', ['line', line.e ? 'err' : '', level ? `lvl-${level}` : ''].filter(Boolean).join(' '))
   if (withTime && line.t) node.append(el('span', 'ts', `${formatTime(line.t)} `))
   if (line.src) node.append(el('span', `src f${sourceColor(line.src)}`, `${line.src.padEnd(sourceWidth)} │ `))
-  for (const segment of parseAnsi(line.m)) node.append(styled(segment.text, segment.style))
+  const segments = parseAnsi(line.m)
+  if (segments.every((s) => Object.keys(s.style).length === 0)) {
+    // Most programs drop their colours when Docker, not a terminal, reads their output: colour the
+    // level word ourselves so INFO, WARNING and ERROR still stand out.
+    const text = segments.map((s) => s.text).join('')
+    const token = levelToken(text)
+    if (token) {
+      node.append(text.slice(0, token.start), el('span', `level-word ${token.tone}`, text.slice(token.start, token.end)), text.slice(token.end))
+    } else if (text) {
+      node.append(text)
+    }
+  } else {
+    for (const segment of segments) node.append(styled(segment.text, segment.style))
+  }
   if (node.childNodes.length === 0) node.append('​') // keep empty lines one line tall
   return node
 }
@@ -575,7 +588,7 @@ async function loadLogs(force = false): Promise<void> {
 }
 
 function openedTerminal(what: string): void {
-  setNotice(`${what} opened in a new terminal tab of this workspace.`)
+  setNotice(`${what} opened in a new terminal tab.`)
 }
 
 async function act(row: ServiceRow, action: ServiceAction): Promise<void> {
@@ -667,7 +680,7 @@ async function askAgent(): Promise<void> {
   els.ask.disabled = true
   try {
     const { agent } = await orca.plugin.request('agent.ask', { path, source: logSource(), lines })
-    setNotice(`Started ${agent} with the last ${Math.min(lines.length, 300)} lines in a new terminal tab.`)
+    setNotice(`Started ${agent} with the last ${Math.min(lines.length, 300)} log lines.`)
   } catch (error) {
     setNotice(`Could not start the agent: ${errorText(error)}`, true)
   } finally {
