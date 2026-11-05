@@ -18,7 +18,8 @@ import {
   type ComposeConfig
 } from './docker'
 import type { FocusContext, ProjectAction, Requests, ServiceAction, ServiceRow, Workspace } from './protocol'
-import { revealTerminal } from './orca-cli'
+import { openFile, revealTerminal } from './orca-cli'
+import { resolveSource } from './sources'
 import { ProblemTracker, summarize } from './status'
 import { hasComposeFile, localOnly, resolveFocused, type ListedWorkspace } from './workspaces'
 
@@ -40,6 +41,9 @@ const STATUS_POLL_MS = 10_000
 const STATUS_ITEM = 'containers'
 const AGENT_MAX_LINES = 300
 const AGENT_MAX_CHARS = 24_000
+/** Stack trace paths: absolute, no parent segments or control characters. */
+const TRACE_PATH = /^\/(?!.*(?:^|\/)\.\.(?:\/|$))[^\0-\x1f]{1,1023}$/
+const MAX_FILES = 200
 
 let statusTimer: ReturnType<typeof setInterval> | null = null
 
@@ -72,6 +76,16 @@ function checkName(value: unknown, what: string): string {
 function checkContainer(id: unknown): string {
   if (typeof id === 'string' && CONTAINER_ID.test(id)) return id
   throw invalid('Invalid container id')
+}
+
+function checkTracePath(value: unknown): string {
+  if (typeof value === 'string' && TRACE_PATH.test(value)) return value
+  throw invalid('Invalid file path')
+}
+
+function checkPosition(value: unknown, what: string): number {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 10_000_000) return value
+  throw invalid(`Invalid ${what}`)
 }
 
 function checkTime(value: unknown): string | null {
@@ -261,6 +275,29 @@ export default function activate(orca: OrcaWorkerApi): void {
       const name = checkName(input.name, 'container name')
       const shell = 'command -v bash >/dev/null 2>&1 && exec bash || exec sh'
       return { terminalId: await openTerminal(input.path, `shell ${name}`, ['exec', '-it', id, 'sh', '-c', shell]) }
+    },
+
+    'code.resolve': async (input) => {
+      const { path } = await workspaceFor(input.path)
+      const service = checkName(input.service, 'service name')
+      const files = (Array.isArray(input.files) ? input.files : []).map(checkTracePath)
+      if (files.length > MAX_FILES) throw invalid('Too many files')
+      const mounts = (await composeConfig(path, await docker(), false)).config.services[service]?.mounts ?? []
+      const found = await Promise.all(files.map((file) => resolveSource(path, mounts, file)))
+      return { files: Object.fromEntries(files.map((file, i) => [file, found[i]])) }
+    },
+
+    'code.open': async (input) => {
+      const { path } = await workspaceFor(input.path)
+      const service = checkName(input.service, 'service name')
+      const file = checkTracePath(input.file)
+      const line = checkPosition(input.line, 'line')
+      const column = input.column === undefined ? undefined : checkPosition(input.column, 'column')
+      const mounts = (await composeConfig(path, await docker(), false)).config.services[service]?.mounts ?? []
+      const relative = await resolveSource(path, mounts, file)
+      if (!relative) throw fail('action_failed', `${file} is not a file of this project`)
+      await openFile(path, relative, line, column)
+      return { opened: relative }
     },
 
     'agent.ask': async (input) => {

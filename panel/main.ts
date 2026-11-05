@@ -15,6 +15,8 @@ import { problemOf } from '../src/status'
 import { parseAnsi, stripAnsi, type Style } from './ansi'
 import { icon, type IconName } from './icons'
 import { levels, levelToken, type Level } from './levels'
+import { findLinks, type LogLink } from './links'
+import { parseBytes, parsePercent, sparkPoints } from './sparkline'
 
 type Orca = {
   on(event: 'workspace.changed', handler: (payload: { context: FocusContext }) => void): unknown
@@ -96,6 +98,19 @@ let generation = 0
 let servicesInFlight = false
 let logsInFlight = false
 let statsInFlight = false
+
+/** Resource samples per container, newest last, from each `stats.get` while the panel is open. */
+const HISTORY_SAMPLES = 60
+const SPARK_WIDTH = 46
+const SPARK_HEIGHT = 14
+type Sample = { cpu: number; mem: number }
+const history = new Map<string, Sample[]>()
+
+/** `service\0container path` → project file (relative), null when it is not one; absent while unknown. */
+const sources = new Map<string, string | null>()
+/** Stack trace paths seen on screen and not asked about yet, by service. */
+const unresolved = new Map<string, Set<string>>()
+let resolving = false
 let noticeTimer: ReturnType<typeof setTimeout> | undefined
 let downTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -256,6 +271,44 @@ function renderAllRow(): HTMLLIElement | null {
   return item
 }
 
+function formatBytes(bytes: number): string {
+  return bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)}GiB` : `${(bytes / 1024 ** 2).toFixed(1)}MiB`
+}
+
+function historyText(samples: Sample[]): string {
+  const cpu = samples.map((s) => s.cpu)
+  const mem = samples.map((s) => s.mem)
+  const minutes = Math.max(1, Math.round((samples.length * SERVICES_POLL_MS) / 60_000))
+  return [
+    `Last ~${minutes} min (line: CPU, dashes: memory)`,
+    `CPU ${Math.min(...cpu).toFixed(1)}–${Math.max(...cpu).toFixed(1)}%`,
+    `Memory ${formatBytes(Math.min(...mem))}–${formatBytes(Math.max(...mem))}`
+  ].join('\n')
+}
+
+/** CPU (line) and memory (dashes) over the last samples; idle CPU stays near the bottom. */
+function sparkline(samples: Sample[]): SVGSVGElement {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+  svg.setAttribute('viewBox', `0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`)
+  svg.setAttribute('class', 'spark')
+  svg.setAttribute('aria-hidden', 'true')
+  const cpu = samples.map((s) => s.cpu)
+  const mem = samples.map((s) => s.mem)
+  const series: [number[], number, string][] = [
+    [mem, Math.max(...mem) * 1.15 || 1, 'spark-mem'],
+    [cpu, Math.max(10, ...cpu), 'spark-cpu']
+  ]
+  // A short history spreads over the width; past 12 samples it compresses, up to HISTORY_SAMPLES.
+  const slots = Math.max(12, samples.length)
+  for (const [values, max, className] of series) {
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline')
+    line.setAttribute('points', sparkPoints(values, slots, SPARK_WIDTH, SPARK_HEIGHT, max))
+    line.setAttribute('class', className)
+    svg.append(line)
+  }
+  return svg
+}
+
 function renderServices(): void {
   const replicas = new Map<string, number>()
   for (const row of state.rows) replicas.set(row.service, (replicas.get(row.service) ?? 0) + 1)
@@ -269,6 +322,8 @@ function renderServices(): void {
     const tooltip = [row.name, status]
     if (row.healthLog) tooltip.push(`Last health check: ${row.healthLog}`)
     if (usage) tooltip.push(`CPU ${usage.cpu}`, `Memory ${usage.mem} / ${usage.memLimit} (${usage.memPercent})`)
+    const samples = row.containerId && row.state === 'running' ? history.get(row.containerId) ?? [] : []
+    if (samples.length >= 2) tooltip.push(historyText(samples))
     pick.title = tooltip.join('\n')
     const text = el('span', 'text')
     text.append(
@@ -280,13 +335,18 @@ function renderServices(): void {
     item.append(pick)
 
     const side = el('span', 'side')
-    if (usage) side.append(el('span', 'usage', `${usage.cpu} ${usage.mem}`))
+    if (usage) {
+      const usageRow = el('span', 'usage-row')
+      if (samples.length >= 2) usageRow.append(sparkline(samples))
+      usageRow.append(el('span', 'usage', `${usage.cpu} ${usage.mem}`))
+      side.append(usageRow)
+    }
     if (row.state === 'running' && row.ports.length) {
       const ports = el('span', 'ports')
       for (const port of row.ports.slice(0, 4)) {
         const link = el('button', 'port', `:${port}`)
         link.title = `Open http://localhost:${port}`
-        link.addEventListener('click', () => void openPort(port))
+        link.addEventListener('click', () => void openUrl(`http://localhost:${port}`))
         ports.append(link)
       }
       side.append(ports)
@@ -345,23 +405,65 @@ function visibleLines(): Shown[] {
   )
 }
 
-function renderLine({ line, level }: Shown, withTime: boolean, sourceWidth: number): HTMLElement {
+function linkLabel(link: LogLink, source: string | null | undefined): string {
+  return link.kind === 'url' ? `Open ${link.url}` : `Open ${source}:${link.line} in the editor`
+}
+
+/**
+ * `text` with its web addresses and stack trace locations as links. A location becomes a link once
+ * the worker confirmed it is a file of the project; until then it is queued and stays text.
+ */
+function linkified(text: string, wrap: (piece: string) => Node, service: string | null): Node[] {
+  const nodes: Node[] = []
+  let last = 0
+  for (const link of findLinks(text)) {
+    let source: string | null | undefined
+    if (link.kind === 'file') {
+      if (!service) continue
+      source = sources.get(`${service}\0${link.file}`)
+      if (source === undefined) unresolved.set(service, (unresolved.get(service) ?? new Set()).add(link.file))
+      if (!source) continue
+    }
+    if (link.start > last) nodes.push(wrap(text.slice(last, link.start)))
+    const anchor = el('span', 'log-link')
+    anchor.append(wrap(text.slice(link.start, link.end)))
+    anchor.setAttribute('role', 'link')
+    anchor.tabIndex = 0
+    anchor.title = linkLabel(link, source)
+    const activate = () => void (link.kind === 'url' ? openUrl(link.url) : openSource(service as string, link))
+    anchor.addEventListener('click', activate)
+    anchor.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') activate()
+    })
+    nodes.push(anchor)
+    last = link.end
+  }
+  if (last < text.length) nodes.push(wrap(text.slice(last)))
+  return nodes
+}
+
+function renderLine({ line, level }: Shown, withTime: boolean, sourceWidth: number, service: string | null): HTMLElement {
   const node = el('div', ['line', line.e ? 'err' : '', level ? `lvl-${level}` : ''].filter(Boolean).join(' '))
   if (withTime && line.t) node.append(el('span', 'ts', `${formatTime(line.t)} `))
   if (line.src) node.append(el('span', `src f${sourceColor(line.src)}`, `${line.src.padEnd(sourceWidth)} │ `))
   const segments = parseAnsi(line.m)
+  const plain = (piece: string) => document.createTextNode(piece)
   if (segments.every((s) => Object.keys(s.style).length === 0)) {
     // Most programs drop their colours when Docker, not a terminal, reads their output: colour the
     // level word ourselves so INFO, WARNING and ERROR still stand out.
     const text = segments.map((s) => s.text).join('')
     const token = levelToken(text)
     if (token) {
-      node.append(text.slice(0, token.start), el('span', `level-word ${token.tone}`, text.slice(token.start, token.end)), text.slice(token.end))
+      node.append(
+        ...linkified(text.slice(0, token.start), plain, service),
+        el('span', `level-word ${token.tone}`, text.slice(token.start, token.end)),
+        ...linkified(text.slice(token.end), plain, service)
+      )
     } else if (text) {
-      node.append(text)
+      node.append(...linkified(text, plain, service))
     }
   } else {
-    for (const segment of segments) node.append(styled(segment.text, segment.style))
+    for (const segment of segments) node.append(...linkified(segment.text, (piece) => styled(piece, segment.style), service))
   }
   if (node.childNodes.length === 0) node.append('​') // keep empty lines one line tall
   return node
@@ -398,13 +500,43 @@ function renderLog(scrollToEnd = false): void {
     if (state.truncated && !filtered) fragment.append(el('div', 'placeholder', 'Older lines are not shown.'))
     const withTime = els.timestamps.checked
     const sourceWidth = Math.max(0, ...shown.map((s) => s.line.src?.length ?? 0))
-    for (const item of shown) fragment.append(renderLine(item, withTime, sourceWidth))
+    const serviceByName = new Map(state.rows.map((r) => [r.name, r.service]))
+    const selected = selectedRow()?.service ?? null
+    for (const item of shown) {
+      const service = item.line.src ? serviceByName.get(item.line.src) ?? null : selected
+      fragment.append(renderLine(item, withTime, sourceWidth, service))
+    }
     if (!shown.length) fragment.append(el('div', 'placeholder', filtered ? 'No lines match.' : 'No log lines yet.'))
   }
   els.ask.disabled = shown.length === 0
   els.save.disabled = shown.length === 0
   pane.replaceChildren(fragment)
   if (scrollToEnd || (els.follow.checked && atEnd)) pane.scrollTop = pane.scrollHeight
+  if (unresolved.size) void resolveSources()
+}
+
+/** Asks the worker which queued stack trace paths are project files, then draws them as links. */
+async function resolveSources(): Promise<void> {
+  const path = state.path
+  if (!path || resolving || !unresolved.size) return
+  resolving = true
+  const batch = [...unresolved].map(([service, files]) => [service, [...files].slice(0, 200)] as const)
+  unresolved.clear()
+  try {
+    for (const [service, files] of batch) {
+      let found: Record<string, string | null> = {}
+      try {
+        found = (await orca.plugin.request('code.resolve', { path, service, files })).files
+      } catch {
+        // Unknown stays text; not asking again keeps a failing worker from being called every render.
+      }
+      if (path !== state.path) return
+      for (const file of files) sources.set(`${service}\0${file}`, found[file] ?? null)
+    }
+  } finally {
+    resolving = false
+  }
+  renderLog()
 }
 
 // ---------- data ----------
@@ -450,6 +582,9 @@ function setPath(path: string | null): void {
   state.clearedAt = null
   state.logError = null
   state.stats = {}
+  history.clear()
+  sources.clear()
+  unresolved.clear()
   state.confirmDown = false
   generation++
   renderWorkspaces()
@@ -515,6 +650,11 @@ async function loadStats(): Promise<void> {
     const { stats } = await orca.plugin.request('stats.get', { path, containerIds }, { timeoutMs: 45_000 })
     if (path !== state.path) return
     state.stats = stats
+    for (const [id, usage] of Object.entries(stats)) {
+      const cpu = parsePercent(usage.cpu)
+      const mem = parseBytes(usage.mem)
+      if (cpu !== null && mem !== null) history.set(id, [...(history.get(id) ?? []), { cpu, mem }].slice(-HISTORY_SAMPLES))
+    }
   } catch {
     if (path !== state.path) return
     state.stats = {}
@@ -658,11 +798,21 @@ async function openShell(row: ServiceRow): Promise<void> {
   }
 }
 
-async function openPort(port: number): Promise<void> {
+async function openUrl(url: string): Promise<void> {
   try {
-    await orca.shell.openExternal(`http://localhost:${port}`)
+    await orca.shell.openExternal(url)
   } catch (error) {
     setNotice(`Could not open the browser: ${errorText(error)}`, true)
+  }
+}
+
+async function openSource(service: string, link: { file: string; line: number; column?: number }): Promise<void> {
+  if (!state.path) return
+  try {
+    const column = link.column ? { column: link.column } : {}
+    await orca.plugin.request('code.open', { path: state.path, service, file: link.file, line: link.line, ...column })
+  } catch (error) {
+    setNotice(`Could not open ${link.file}: ${errorText(error)}`, true)
   }
 }
 

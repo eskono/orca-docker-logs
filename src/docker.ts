@@ -96,16 +96,23 @@ export function lines(stdout: string): string[] {
 /** What the panel needs from `docker compose config --format json`. */
 export type ComposeConfig = {
   name: string
-  services: Record<string, { profiles: string[]; build: boolean }>
+  services: Record<string, { profiles: string[]; build: boolean; mounts: Mount[] }>
 }
 
+/** A bind mount: a folder of this machine (`source`) seen at `target` inside the container. */
+export type Mount = { source: string; target: string }
+
 export function parseConfig(stdout: string): ComposeConfig {
-  const raw = JSON.parse(stdout) as { name?: unknown; services?: Record<string, { profiles?: unknown; build?: unknown }> }
+  type RawService = { profiles?: unknown; build?: unknown; volumes?: { type?: unknown; source?: unknown; target?: unknown }[] }
+  const raw = JSON.parse(stdout) as { name?: unknown; services?: Record<string, RawService> }
   if (typeof raw.name !== 'string' || !raw.name) throw fail('action_failed', 'docker compose config printed no project name')
   const services: ComposeConfig['services'] = {}
   for (const [name, service] of Object.entries(raw.services ?? {})) {
     const profiles = Array.isArray(service.profiles) ? service.profiles.filter((p): p is string => typeof p === 'string') : []
-    services[name] = { profiles, build: service.build !== undefined && service.build !== null }
+    const mounts = (Array.isArray(service.volumes) ? service.volumes : []).flatMap((v) =>
+      v.type === 'bind' && typeof v.source === 'string' && typeof v.target === 'string' ? [{ source: v.source, target: v.target }] : []
+    )
+    services[name] = { profiles, build: service.build !== undefined && service.build !== null, mounts }
   }
   return { name: raw.name, services }
 }
@@ -190,7 +197,7 @@ export function buildRows(config: ComposeConfig, containers: Container[]): Servi
   // Containers of services the file no longer declares (orphans) go last.
   const names = [...declared, ...[...byService.keys()].filter((s) => !declared.includes(s))]
   return names.flatMap((service): ServiceRow[] => {
-    const { profiles, build } = config.services[service] ?? { profiles: [], build: false }
+    const { profiles, build } = config.services[service] ?? { profiles: [], build: false, mounts: [] }
     const own = (byService.get(service) ?? []).sort((a, b) => a.name.localeCompare(b.name))
     if (own.length === 0) {
       return [

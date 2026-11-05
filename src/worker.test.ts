@@ -10,7 +10,11 @@ const WORKER = 'b'.repeat(64)
 
 const CONFIG = {
   name: 'proj',
-  services: { app: { build: { context: '.' } }, worker: { image: 'busybox' }, caddy: { image: 'caddy', profiles: ['web'] } }
+  services: {
+    app: { build: { context: '.' }, volumes: [{ type: 'bind', source: '__PROJECT__/src', target: '/srv/app' }] },
+    worker: { image: 'busybox' },
+    caddy: { image: 'caddy', profiles: ['web'] }
+  }
 }
 
 const INSPECT = [
@@ -63,11 +67,13 @@ async function setup() {
   const docker = join(root, 'docker')
   await Promise.all([
     writeFile(join(project, 'compose.yaml'), 'services: {}\n'),
-    writeFile(join(root, 'config.json'), JSON.stringify(CONFIG)),
+    writeFile(join(root, 'config.json'), JSON.stringify(CONFIG).replace('__PROJECT__', project)),
     writeFile(join(root, 'inspect.json'), JSON.stringify(INSPECT)),
     writeFile(docker, FAKE_DOCKER)
   ])
   await chmod(docker, 0o755)
+  await mkdir(join(project, 'src', 'core'), { recursive: true })
+  await writeFile(join(project, 'src', 'core', 'media.py'), '')
   await mkdir(join(root, 'bin'))
   await writeFile(join(root, 'bin', 'orca'), FAKE_ORCA)
   await chmod(join(root, 'bin', 'orca'), 0o755)
@@ -239,6 +245,23 @@ test('shows the focused project in the status bar', async () => {
   assert.equal(host.callsOf('notifications.show').length, 0) // already broken when focused: no alert
   await worker.emit('workspace.changed', { context: { displayName: 'main', branch: 'main', terminals: [] } })
   assert.deepEqual(host.callsOf('statusBar.update').at(-1), { id: 'containers', visible: false })
+  await worker.deactivate()
+})
+
+test('maps stack trace paths to project files and opens them at the line', async () => {
+  const { worker, project, orcaCalls } = await setup()
+  const { files } = await worker.request('code.resolve', {
+    path: project,
+    service: 'app',
+    files: ['/srv/app/core/media.py', '/usr/local/lib/python3.12/site-packages/fastapi/routing.py']
+  })
+  assert.deepEqual(files, { '/srv/app/core/media.py': 'src/core/media.py', '/usr/local/lib/python3.12/site-packages/fastapi/routing.py': null })
+  const answer = await worker.request('code.open', { path: project, service: 'app', file: '/srv/app/core/media.py', line: 42, column: 5 })
+  assert.deepEqual(answer, { opened: 'src/core/media.py' })
+  assert.deepEqual(await orcaCalls(), [`file open src/core/media.py --line 42 --column 5 --worktree path:${project} --focus --json`])
+  await assert.rejects(worker.request('code.open', { path: project, service: 'app', file: '/etc/passwd', line: 1 }), { code: 'action_failed' })
+  await assert.rejects(worker.request('code.open', { path: project, service: 'app', file: '/srv/app/../x', line: 1 }), { code: 'invalid_params' })
+  await assert.rejects(worker.request('code.open', { path: project, service: 'app', file: '/srv/app/core/media.py', line: 0 }), { code: 'invalid_params' })
   await worker.deactivate()
 })
 

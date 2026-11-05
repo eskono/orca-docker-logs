@@ -1,5 +1,5 @@
 // The `orca` CLI, for what Orca's plugin API does not offer: which workspace a terminal belongs
-// to, and bringing a terminal to the front.
+// to, bringing a terminal to the front, and opening a file at a line.
 import { dirname, join } from 'node:path'
 import { run } from './docker'
 
@@ -44,4 +44,10 @@ export async function revealTerminal(terminalId: string): Promise<string | null>
     () => null,
     (error: unknown) => (error instanceof Error ? error.message : String(error))
   )
+}
+
+/** Opens a file of a workspace at a line in Orca's editor and switches to it. */
+export async function openFile(workspacePath: string, file: string, line: number, column?: number): Promise<void> {
+  const position = ['--line', String(line), ...(column ? ['--column', String(column)] : [])]
+  await orcaCli(['file', 'open', file, ...position, '--worktree', `path:${workspacePath}`, '--focus'])
 }

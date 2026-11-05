@@ -115,6 +115,12 @@
       .dot.none { background: transparent; border: 1px solid var(--orca-muted-foreground); }
       .all-icon { width: 12px; height: 12px; flex: none; opacity: 0.8; }
       .side { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; flex: none; }
+      .usage-row { display: inline-flex; align-items: center; gap: 6px; }
+      .spark { width: 46px; height: 14px; flex: none; overflow: visible; }
+      .spark polyline { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+      .spark-cpu { stroke: var(--orca-primary); stroke-width: 1.4; }
+      .spark-mem { stroke: var(--ansi-5); stroke-width: 1; stroke-dasharray: 2 1.6; opacity: 0.75; }
+      .selected .spark-cpu, .selected .spark-mem { stroke: currentColor; }
       .usage { color: var(--orca-muted-foreground); font: 11px var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
       .ports { display: flex; gap: 4px; }
       .port {
@@ -164,6 +170,8 @@
       .line.lvl-error { border-left-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
       .ts { color: var(--orca-muted-foreground); user-select: none; }
       .level-word { font-weight: 600; }
+      .log-link { text-decoration: underline dotted; text-underline-offset: 2px; cursor: pointer; }
+      .log-link:hover, .log-link:focus-visible { text-decoration-style: solid; color: var(--orca-primary); }
       .level-word.debug { color: var(--orca-muted-foreground); }
       .level-word.info { color: var(--ansi-2); }
       .level-word.warn { color: var(--ansi-3); }

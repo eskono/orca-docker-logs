@@ -85,6 +85,16 @@ export type Requests = {
   'project.action': { input: { path: string; action: ProjectAction }; output: { terminalId: string | null } }
   /** Opens an Orca terminal with a shell inside a running container. */
   'container.shell': { input: { path: string; containerId: string; name: string }; output: { terminalId: string } }
+  /** Which paths from a service's stack traces are files of the project (project-relative), or null. */
+  'code.resolve': {
+    input: { path: string; service: string; files: string[] }
+    output: { files: Record<string, string | null> }
+  }
+  /** Opens the project file behind a stack trace path at its line in Orca's editor and shows it. */
+  'code.open': {
+    input: { path: string; service: string; file: string; line: number; column?: number }
+    output: { opened: string }
+  }
   /** Starts an agent in the workspace with these log lines and asks it to find the cause. */
   'agent.ask': {
     input: { path: string; source: string; lines: string[] }

@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "docker-logs",
   "name": "Docker Logs",
-  "version": "0.2.1",
-  "description": "See your Docker Compose containers in Orca: live logs with error highlighting, CPU and memory, ports, start/stop/rebuild, a shell, and one click to hand a failing log to your agent.",
+  "version": "0.3.0",
+  "description": "Your Docker Compose containers in Orca: live logs with errors highlighted, stack traces that open the code, CPU and memory history, ports, start/stop/rebuild, a shell, and Ask agent.",
   "author": {
     "name": "Maksim Shevchuk"
   },
@@ -17,14 +17,14 @@
   "screenshots": [
     {
       "path": "assets/screenshot-dark.webp",
-      "alt": "Docker Logs panel: Compose services with state, CPU, memory, ports and actions, above an api log with a traceback highlighted",
-      "caption": "Services with CPU, memory and ports; the selected container’s log with errors highlighted",
+      "alt": "Docker Logs panel: Compose services with CPU and memory charts, ports and actions, above an api log with a linked Python traceback",
+      "caption": "CPU and memory history and ports per service; the log with errors highlighted and the stack trace linked to the code",
       "theme": "dark"
     },
     {
       "path": "assets/screenshot-light.webp",
       "alt": "The same Docker Logs panel in a light theme",
-      "caption": "Services with CPU, memory and ports; the selected container’s log with errors highlighted",
+      "caption": "CPU and memory history and ports per service; the log with errors highlighted and the stack trace linked to the code",
       "theme": "light"
     },
     {

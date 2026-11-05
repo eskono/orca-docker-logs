@@ -26,11 +26,26 @@ const inspectEntry = {
 
 test('reads the compose model: project name, profiles and which services build', () => {
   const config = parseConfig(
-    JSON.stringify({ name: 'proj', services: { app: { build: { context: '.' } }, caddy: { profiles: ['web'], image: 'caddy' } } })
+    JSON.stringify({
+      name: 'proj',
+      services: {
+        app: {
+          build: { context: '.' },
+          volumes: [
+            { type: 'bind', source: '/home/me/proj/app', target: '/srv/app' },
+            { type: 'volume', source: 'cache', target: '/root/.cache' }
+          ]
+        },
+        caddy: { profiles: ['web'], image: 'caddy' }
+      }
+    })
   )
   assert.deepEqual(config, {
     name: 'proj',
-    services: { app: { profiles: [], build: true }, caddy: { profiles: ['web'], build: false } }
+    services: {
+      app: { profiles: [], build: true, mounts: [{ source: '/home/me/proj/app', target: '/srv/app' }] },
+      caddy: { profiles: ['web'], build: false, mounts: [] }
+    }
   })
   assert.throws(() => parseConfig('{"services":{}}'))
 })
@@ -54,7 +69,7 @@ test('reads containers from docker inspect', () => {
 })
 
 test('lists services with their containers, placeholders and orphans', () => {
-  const config = { name: 'proj', services: { app: { profiles: [], build: true }, caddy: { profiles: ['web'], build: false } } }
+  const config = { name: 'proj', services: { app: { profiles: [], build: true, mounts: [] }, caddy: { profiles: ['web'], build: false, mounts: [] } } }
   const [app] = parseInspect(JSON.stringify([inspectEntry]))
   const orphan = { ...app, id: 'c'.repeat(64), name: 'proj-old-1', service: 'old' }
   const rows = buildRows(config, [app, orphan])
