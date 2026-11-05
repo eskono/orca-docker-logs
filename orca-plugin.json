@@ -1,0 +1,49 @@
+{
+  "manifestVersion": 2,
+  "id": "docker-logs",
+  "name": "Docker Logs",
+  "version": "0.1.0",
+  "description": "Logs of the focused project's Docker Compose containers, with start, stop, restart and clear.",
+  "author": {
+    "name": "Maksim Shevchuk"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/eskono/orca-docker-logs",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "docker-logs",
+        "title": "Docker Logs",
+        "icon": "layers",
+        "entry": "panel/index.html"
+      }
+    ],
+    "settings": [
+      {
+        "key": "dockerPath",
+        "title": "Docker CLI path",
+        "description": "Absolute path to the docker binary. Leave empty to find it on PATH, in /usr/local/bin, /opt/homebrew/bin or Docker Desktop.",
+        "type": "string",
+        "default": "",
+        "placeholder": "/usr/local/bin/docker"
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    }
+  ]
+}

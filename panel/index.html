@@ -1,0 +1,167 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Docker Logs</title>
+    <style>
+      :root {
+        --ansi-0: #3b3b3b; --ansi-1: #c4302b; --ansi-2: #2f8a3b; --ansi-3: #9a6a00;
+        --ansi-4: #2b5fc4; --ansi-5: #a03ab3; --ansi-6: #16808a; --ansi-7: #6e6e6e;
+        --ansi-8: #5e5e5e; --ansi-9: #e0443e; --ansi-10: #3aa64a; --ansi-11: #b88300;
+        --ansi-12: #3d74e0; --ansi-13: #bf4fd1; --ansi-14: #1c9ba6; --ansi-15: #2a2a2a;
+        --ok: #2f9e44; --warn: #d08c00; --bad: var(--orca-destructive, #d9363e);
+        --radius: var(--orca-radius, 6px);
+        --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      html.dark {
+        --ansi-0: #4d4d4d; --ansi-1: #f2635c; --ansi-2: #5cc26b; --ansi-3: #e3b341;
+        --ansi-4: #5c9dff; --ansi-5: #d07ae0; --ansi-6: #3fc1cc; --ansi-7: #c8c8c8;
+        --ansi-8: #8a8a8a; --ansi-9: #ff8079; --ansi-10: #7be08a; --ansi-11: #ffd36b;
+        --ansi-12: #8ab8ff; --ansi-13: #e9a1f5; --ansi-14: #74e3eb; --ansi-15: #f2f2f2;
+        --ok: #51cf66; --warn: #fcc419;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        font: 12px/1.4 system-ui, -apple-system, 'Segoe UI', sans-serif;
+        color: var(--orca-foreground);
+        background: var(--orca-background);
+      }
+      button, select, input { font: inherit; color: inherit; }
+      button, select, input[type='search'] {
+        border: 1px solid var(--orca-input, var(--orca-border));
+        border-radius: var(--radius);
+        background: var(--orca-background);
+        padding: 2px 8px;
+        min-height: 24px;
+      }
+      button { cursor: pointer; background: var(--orca-secondary); color: var(--orca-secondary-foreground); }
+      button:hover:not(:disabled) { background: var(--orca-accent); color: var(--orca-accent-foreground); }
+      button:disabled { opacity: 0.5; cursor: default; }
+      :focus-visible { outline: 2px solid var(--orca-ring); outline-offset: 1px; }
+      [hidden] { display: none !important; }
+
+      .toolbar { display: flex; gap: 6px; padding: 8px; border-bottom: 1px solid var(--orca-border); }
+      .toolbar select { flex: 1; min-width: 0; }
+      .icon { width: 26px; padding: 0; flex: none; }
+
+      .notice {
+        margin: 8px 8px 0;
+        padding: 6px 8px;
+        border-radius: var(--radius);
+        background: var(--orca-muted);
+        color: var(--orca-muted-foreground);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .notice.error { color: var(--bad); }
+
+      .services {
+        list-style: none;
+        margin: 0;
+        padding: 4px;
+        max-height: 40%;
+        overflow-y: auto;
+        flex: none;
+        border-bottom: 1px solid var(--orca-border);
+      }
+      .services:empty { display: none; }
+      .service { display: flex; align-items: center; gap: 4px; border-radius: var(--radius); }
+      .service.selected { background: var(--orca-accent); color: var(--orca-accent-foreground); }
+      .pick {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        border: 0;
+        background: transparent;
+        color: inherit;
+        text-align: left;
+        padding: 3px 6px;
+      }
+      .pick:hover:not(:disabled) { background: transparent; color: inherit; }
+      .service:not(.selected):hover { background: var(--orca-muted); }
+      .name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .status { color: var(--orca-muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+      .selected .status { color: inherit; opacity: 0.75; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--orca-muted-foreground); }
+      .dot.ok { background: var(--ok); }
+      .dot.warn { background: var(--warn); }
+      .dot.bad { background: var(--bad); }
+      .dot.off { opacity: 0.5; }
+      .dot.none { background: transparent; border: 1px solid var(--orca-muted-foreground); }
+      .actions { display: flex; gap: 2px; padding-right: 4px; flex: none; }
+      .actions button { width: 24px; min-height: 22px; padding: 0; background: transparent; border-color: transparent; color: inherit; }
+      .actions button:hover:not(:disabled) { border-color: var(--orca-border); }
+
+      .logbar { display: flex; flex-direction: column; gap: 6px; padding: 8px; flex: none; }
+      .row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+      .log-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .row input[type='search'] { flex: 1; min-width: 80px; }
+      label { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; cursor: pointer; }
+      .cleared { color: var(--orca-muted-foreground); }
+      .link { border: 0; background: none; padding: 0; min-height: 0; color: var(--orca-primary); text-decoration: underline; }
+      .link:hover:not(:disabled) { background: none; color: var(--orca-primary); }
+
+      .log {
+        flex: 1;
+        min-height: 0;
+        overflow: auto;
+        margin: 0 8px 8px;
+        padding: 6px 0;
+        border: 1px solid var(--orca-border);
+        border-radius: var(--radius);
+        background: var(--orca-card);
+        color: var(--orca-card-foreground);
+        font: 11.5px/1.45 var(--mono);
+        white-space: pre;
+      }
+      .log.wrap { white-space: pre-wrap; word-break: break-word; }
+      .line { padding: 0 8px 0 6px; border-left: 2px solid transparent; }
+      /* Many programs log everything to stderr (Python, Postgres), so it is marked, not alarmed. */
+      .line.err { border-left-color: var(--orca-border); }
+      .ts { color: var(--orca-muted-foreground); user-select: none; }
+      .placeholder { padding: 4px 8px; color: var(--orca-muted-foreground); font-family: system-ui, sans-serif; white-space: normal; }
+      .b { font-weight: 700; } .d { opacity: 0.7; } .i { font-style: italic; } .u { text-decoration: underline; }
+      .f0 { color: var(--ansi-0); } .f1 { color: var(--ansi-1); } .f2 { color: var(--ansi-2); } .f3 { color: var(--ansi-3); }
+      .f4 { color: var(--ansi-4); } .f5 { color: var(--ansi-5); } .f6 { color: var(--ansi-6); } .f7 { color: var(--ansi-7); }
+      .f8 { color: var(--ansi-8); } .f9 { color: var(--ansi-9); } .f10 { color: var(--ansi-10); } .f11 { color: var(--ansi-11); }
+      .f12 { color: var(--ansi-12); } .f13 { color: var(--ansi-13); } .f14 { color: var(--ansi-14); } .f15 { color: var(--ansi-15); }
+      .k0 { background: var(--ansi-0); } .k1 { background: var(--ansi-1); } .k2 { background: var(--ansi-2); } .k3 { background: var(--ansi-3); }
+      .k4 { background: var(--ansi-4); } .k5 { background: var(--ansi-5); } .k6 { background: var(--ansi-6); } .k7 { background: var(--ansi-7); }
+      .k8 { background: var(--ansi-8); } .k9 { background: var(--ansi-9); } .k10 { background: var(--ansi-10); } .k11 { background: var(--ansi-11); }
+      .k12 { background: var(--ansi-12); } .k13 { background: var(--ansi-13); } .k14 { background: var(--ansi-14); } .k15 { background: var(--ansi-15); }
+    </style>
+  </head>
+  <body>
+    <header class="toolbar">
+      <select id="workspace" aria-label="Project"></select>
+      <button id="refresh" class="icon" title="Refresh" aria-label="Refresh">↻</button>
+    </header>
+    <div id="notice" class="notice" role="status" hidden></div>
+    <ul id="services" class="services" aria-label="Containers"></ul>
+    <div class="logbar">
+      <div class="row">
+        <strong id="log-title" class="log-title">Logs</strong>
+        <button id="clear" title="Hide everything logged so far" disabled>Clear</button>
+      </div>
+      <div class="row">
+        <input id="filter" type="search" placeholder="Filter" aria-label="Filter log lines" />
+        <label><input id="follow" type="checkbox" checked /> Follow</label>
+        <label><input id="timestamps" type="checkbox" /> Time</label>
+        <label><input id="wrap" type="checkbox" checked /> Wrap</label>
+      </div>
+      <div id="cleared" class="cleared" hidden>
+        <span id="cleared-text"></span>
+        <button id="show-all" class="link">Show all</button>
+      </div>
+    </div>
+    <div id="log" class="log wrap" tabindex="0" role="log" aria-label="Container log"></div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
