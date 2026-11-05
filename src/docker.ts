@@ -88,52 +88,143 @@ export function run(
   })
 }
 
-type PsEntry = {
-  ID: string
-  Name: string
-  Service: string
-  State: string
-  Status: string
-  Health?: string
-}
-
-/** `docker compose ps --format json`: a JSON array before Compose 2.21, one object per line after. */
-export function parsePs(stdout: string): PsEntry[] {
-  const text = stdout.trim()
-  if (!text) return []
-  const values: unknown[] = text.startsWith('[')
-    ? (JSON.parse(text) as unknown[])
-    : text.split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line) as unknown)
-  return values.filter(
-    (v): v is PsEntry =>
-      typeof v === 'object' && v !== null && typeof (v as PsEntry).ID === 'string' && typeof (v as PsEntry).Service === 'string'
-  )
-}
-
-/** `docker compose config --services`: one name per line. */
-export function parseServices(stdout: string): string[] {
+/** Non-empty trimmed lines, as `config --profiles` and `ps -q` print them. */
+export function lines(stdout: string): string[] {
   return stdout.split('\n').map((s) => s.trim()).filter(Boolean)
 }
 
-/** Services in compose order, each followed by its containers; a service without one gets a placeholder row. */
-export function buildRows(services: string[], containers: PsEntry[]): ServiceRow[] {
-  const byService = new Map<string, PsEntry[]>()
-  for (const c of containers) byService.set(c.Service, [...(byService.get(c.Service) ?? []), c])
-  // Containers of services the config no longer lists (orphans, inactive profiles) go last.
-  const names = [...services, ...[...byService.keys()].filter((s) => !services.includes(s))]
+/** What the panel needs from `docker compose config --format json`. */
+export type ComposeConfig = {
+  name: string
+  services: Record<string, { profiles: string[]; build: boolean }>
+}
+
+export function parseConfig(stdout: string): ComposeConfig {
+  const raw = JSON.parse(stdout) as { name?: unknown; services?: Record<string, { profiles?: unknown; build?: unknown }> }
+  if (typeof raw.name !== 'string' || !raw.name) throw fail('action_failed', 'docker compose config printed no project name')
+  const services: ComposeConfig['services'] = {}
+  for (const [name, service] of Object.entries(raw.services ?? {})) {
+    const profiles = Array.isArray(service.profiles) ? service.profiles.filter((p): p is string => typeof p === 'string') : []
+    services[name] = { profiles, build: service.build !== undefined && service.build !== null }
+  }
+  return { name: raw.name, services }
+}
+
+/** One container from `docker inspect`, with what the rows show. */
+export type Container = {
+  id: string
+  name: string
+  service: string
+  state: string
+  exitCode: number | null
+  health: string
+  healthLog: string
+  startedAt: string | null
+  finishedAt: string | null
+  ports: number[]
+}
+
+type InspectEntry = {
+  Id?: unknown
+  Name?: unknown
+  State?: {
+    Status?: unknown
+    ExitCode?: unknown
+    StartedAt?: unknown
+    FinishedAt?: unknown
+    Health?: { Status?: unknown; Log?: { Output?: unknown }[] }
+  }
+  Config?: { Labels?: Record<string, unknown> }
+  NetworkSettings?: { Ports?: Record<string, { HostPort?: unknown }[] | null> }
+}
+
+/** Docker's "never" timestamp (`0001-01-01T00:00:00Z`) and missing values become null. */
+function time(value: unknown): string | null {
+  return typeof value === 'string' && !value.startsWith('0001-') ? value : null
+}
+
+/** Published TCP host ports, once each (Docker lists IPv4 and IPv6 bindings separately). */
+function publishedPorts(ports: Record<string, { HostPort?: unknown }[] | null> | undefined): number[] {
+  const found = new Set<number>()
+  for (const [key, bindings] of Object.entries(ports ?? {})) {
+    if (!key.endsWith('/tcp')) continue
+    for (const binding of bindings ?? []) {
+      const port = Number(binding.HostPort)
+      if (Number.isInteger(port) && port > 0) found.add(port)
+    }
+  }
+  return [...found].sort((a, b) => a - b)
+}
+
+export function parseInspect(stdout: string): Container[] {
+  const entries = JSON.parse(stdout) as InspectEntry[]
+  return entries.flatMap((entry): Container[] => {
+    const service = entry.Config?.Labels?.['com.docker.compose.service']
+    if (typeof entry.Id !== 'string' || typeof service !== 'string') return []
+    const state = entry.State ?? {}
+    // Docker keeps the last health status after a container stops; it only means something while it runs.
+    const health = state.Status === 'running' && typeof state.Health?.Status === 'string' ? state.Health.Status : ''
+    const lastCheck = state.Health?.Log?.at(-1)?.Output
+    return [
+      {
+        id: entry.Id,
+        name: String(entry.Name ?? '').replace(/^\//, ''),
+        service,
+        state: typeof state.Status === 'string' ? state.Status : 'unknown',
+        exitCode: typeof state.ExitCode === 'number' ? state.ExitCode : null,
+        health,
+        healthLog: health && health !== 'healthy' && typeof lastCheck === 'string' ? lastCheck.trim().slice(0, 1000) : '',
+        startedAt: time(state.StartedAt),
+        finishedAt: time(state.FinishedAt),
+        ports: publishedPorts(entry.NetworkSettings?.Ports)
+      }
+    ]
+  })
+}
+
+/** Services of the compose file, each followed by its containers; a service without one gets a placeholder row. */
+export function buildRows(config: ComposeConfig, containers: Container[]): ServiceRow[] {
+  const byService = new Map<string, Container[]>()
+  for (const c of containers) byService.set(c.service, [...(byService.get(c.service) ?? []), c])
+  const declared = Object.keys(config.services)
+  // Containers of services the file no longer declares (orphans) go last.
+  const names = [...declared, ...[...byService.keys()].filter((s) => !declared.includes(s))]
   return names.flatMap((service): ServiceRow[] => {
-    const own = (byService.get(service) ?? []).sort((a, b) => a.Name.localeCompare(b.Name))
+    const { profiles, build } = config.services[service] ?? { profiles: [], build: false }
+    const own = (byService.get(service) ?? []).sort((a, b) => a.name.localeCompare(b.name))
     if (own.length === 0) {
-      return [{ key: `service:${service}`, service, containerId: null, name: service, state: 'not created', status: 'Not created', health: '' }]
+      return [
+        {
+          key: `service:${service}`,
+          service,
+          containerId: null,
+          name: service,
+          state: 'not created',
+          exitCode: null,
+          health: '',
+          healthLog: '',
+          startedAt: null,
+          finishedAt: null,
+          ports: [],
+          profiles,
+          build
+        }
+      ]
     }
     return own.map((c) => ({
-      key: c.ID,
+      key: c.id,
       service,
-      containerId: c.ID,
-      name: c.Name,
-      state: c.State,
-      status: c.Status,
-      health: c.Health ?? ''
+      containerId: c.id,
+      name: c.name,
+      state: c.state,
+      exitCode: c.exitCode,
+      health: c.health,
+      healthLog: c.healthLog,
+      startedAt: c.startedAt,
+      finishedAt: c.finishedAt,
+      ports: c.ports,
+      profiles,
+      build
     }))
   })
 }
@@ -141,8 +232,7 @@ export function buildRows(services: string[], containers: PsEntry[]): ServiceRow
 /** `docker stats --no-stream --no-trunc --format '{{json .}}'`: one object per line. */
 export function parseStats(stdout: string): Record<string, ContainerStats> {
   const stats: Record<string, ContainerStats> = {}
-  for (const line of stdout.split('\n')) {
-    if (!line.trim()) continue
+  for (const line of lines(stdout)) {
     const entry = JSON.parse(line) as { ID?: unknown; CPUPerc?: unknown; MemUsage?: unknown; MemPerc?: unknown }
     if (typeof entry.ID !== 'string') continue
     const [mem = '', memLimit = ''] = String(entry.MemUsage ?? '').split(' / ')
@@ -151,28 +241,32 @@ export function parseStats(stdout: string): Record<string, ContainerStats> {
   return stats
 }
 
-const TIMESTAMPED =/^(\d{4}-\d\d-\d\dT\S+) ?(.*)$/s
+const TIMESTAMPED = /^(\d{4}-\d\d-\d\dT\S+) ?(.*)$/s
 
-function parseStream(text: string, fromStderr: boolean): LogLine[] {
-  const lines = text.split('\n')
-  if (lines.at(-1) === '') lines.pop()
+function parseStream(text: string, fromStderr: boolean, src?: string): LogLine[] {
+  const raw = text.split('\n')
+  if (raw.at(-1) === '') raw.pop()
   let last = ''
-  return lines.map((raw) => {
-    const match = TIMESTAMPED.exec(raw)
+  return raw.map((line) => {
+    const match = TIMESTAMPED.exec(line)
     if (match) last = match[1]
     // A line without a timestamp (should not happen with --timestamps) sorts with the one before it.
-    return match ? { t: match[1], e: fromStderr, m: match[2] } : { t: last, e: fromStderr, m: raw }
+    const parsed: LogLine = match ? { t: match[1], e: fromStderr, m: match[2] } : { t: last, e: fromStderr, m: line }
+    return src === undefined ? parsed : { ...parsed, src }
   })
 }
 
+/** One container's `docker logs --timestamps` output: its stdout and stderr, each line tagged. */
+export function containerLines(stdout: string, stderr: string, src?: string): LogLine[] {
+  return [...parseStream(stdout, false, src), ...parseStream(stderr, true, src)]
+}
+
 /**
- * `docker logs --timestamps` writes the container's stdout and stderr to its own stdout and
- * stderr. Docker's timestamps are fixed width, so a stable string sort interleaves them in order.
+ * Lines of one or more containers in time order. Docker's timestamps are fixed width, so a
+ * stable string sort interleaves them correctly.
  */
-export function mergeLogs(stdout: string, stderr: string): LogLine[] {
-  return [...parseStream(stdout, false), ...parseStream(stderr, true)].sort((a, b) =>
-    a.t < b.t ? -1 : a.t > b.t ? 1 : 0
-  )
+export function byTime(lines: LogLine[]): LogLine[] {
+  return [...lines].sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0))
 }
 
 const jsonBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value)) + 1
@@ -196,4 +290,9 @@ export function newestWithin(lines: LogLine[], maxBytes: number): { lines: LogLi
     return { lines: [{ ...line, m: line.m.slice(-Math.floor(maxBytes / 8)) }], truncated: true }
   }
   return { lines: lines.slice(start), truncated: start > 0 }
+}
+
+/** Quotes one argument for a POSIX shell, for commands typed into an Orca terminal. */
+export function shellQuote(arg: string): string {
+  return /^[\w@%+=:,./-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`
 }

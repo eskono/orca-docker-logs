@@ -1,58 +1,83 @@
 # Docker Logs
 
-An Orca sidebar panel for the Docker Compose containers of the focused project: their state,
-start / stop / restart, and a live log with ANSI colours, a filter, timestamps and "clear".
+An Orca sidebar panel for the Docker Compose containers of the focused project: state, CPU and
+memory, ports, start / stop / restart / rebuild, a shell, and a live log with error highlighting
+that you can hand to your agent in one click.
 
 **Install:** [onorca.dev/plugins/eskono.docker-logs](https://onorca.dev/plugins/eskono.docker-logs?catalog=community).
-It runs its own worker (it calls the `docker` CLI), so Orca asks you to approve full access.
+It runs its own worker (it calls the `docker` CLI, opens terminals and starts agents), so Orca
+asks you to approve full access.
 
-- **Containers come from the compose files.** The worker runs `docker compose config --services`
-  and `docker compose ps --all` in the workspace folder, so Compose picks the files the way it
-  does in a terminal: `compose.yaml` / `docker-compose.yml` plus their `.override` file, or
-  `COMPOSE_FILE` from the project's `.env`. Services without a container yet are listed too.
-- **The project follows Orca's focus.** The panel switches when you focus another workspace; the
-  picker at the top lists every local workspace with a compose file, to look at another one.
-- **CPU and memory** of each running container from `docker stats`, refreshed every 5 seconds
-  (one sample takes Docker about two seconds); hover a row for the memory limit.
-- **Actions.** ▶ starts a stopped container (`docker start`) or creates a missing one
-  (`docker compose up -d <service>`, which may build or pull first); ■ stops, ↻ restarts.
-- **Clear** hides everything logged so far for that service (it remembers the time and asks
-  `docker logs --since`). Docker's own log file is not touched, so **Show all** brings it back.
-  Truly truncating the log would need root access to the file inside Docker Desktop's VM.
-- **Follow** re-reads the newest 1000 lines every 2 seconds and keeps the view at the bottom
-  unless you scrolled up. Container states refresh every 5 seconds.
+![The panel: services with CPU, memory and ports above the api container's log](assets/screenshot-dark.webp)
 
-## Layout
+## What it does
 
-| File                  | What it does                                                                 |
-| --------------------- | ---------------------------------------------------------------------------- |
-| `orca-plugin.json`    | Manifest: the panel, the worker, the `dockerPath` setting, capabilities       |
-| `src/worker.ts`       | Worker (Node): answers the panel's requests, validates them, runs docker     |
-| `src/docker.ts`       | Finds the docker binary, runs it, parses `compose ps` and `docker logs`      |
-| `src/workspaces.ts`   | Local workspaces with compose files; which one is focused                    |
-| `src/protocol.ts`     | Request and answer types shared by the panel and the worker                  |
-| `panel/index.html`    | Panel markup and styles (Orca theme variables)                               |
-| `panel/main.ts`       | Panel logic: project, containers, actions, log polling and rendering         |
-| `panel/ansi.ts`       | ANSI colour codes to styled segments                                          |
+- **Services from the compose files.** The worker asks `docker compose config` in the workspace
+  folder, so Compose picks the files the way it does in a terminal (`compose.yaml` /
+  `docker-compose.yml`, their `.override`, `COMPOSE_FILE` from `.env`). Services of every
+  profile are listed; one that never ran shows its profile and starts with it.
+- **State at a glance.** A dot per container (running, starting, unhealthy, crashed), uptime,
+  CPU and memory from `docker stats`, and the published ports as links that open
+  `http://localhost:<port>`. Hover a row for the last health check output and the memory limit.
+- **The project follows Orca's focus.** The picker at the top lists every local workspace with a
+  compose file, to look at another one.
+- **Actions.** Per container: shell (`docker exec -it … bash`, or `sh`), rebuild
+  (`compose up -d --build`), restart, stop, start. For the project: Up, Restart and Down (Down
+  asks for a second click). Commands that may build or pull (Up, rebuild, creating a container)
+  run in a new Orca terminal tab so you see their output.
+- **Logs.** One container or **All services** interleaved by time and tagged by container, with
+  ANSI colours. Errors and warnings are highlighted in plain, logfmt and JSON logs, stack traces
+  included; the level picker shows only them. Periods: the last 1000 lines, 5 or 15 minutes, an
+  hour, or since the container started. Filter, timestamps, wrap, and **Save** to a file.
+- **Ask agent** starts the agent set in Settings (Claude by default) in the project's workspace
+  with the lines you are looking at, and asks it to find the cause.
+- **Clear** hides what was logged so far (it remembers the time and asks `docker logs --since`);
+  Docker's log is not touched, so **Show all** brings it back.
+- **Status bar.** `running/total` for the focused project, red when a container crashed, keeps
+  restarting or turns unhealthy, with a desktop notification when that happens (Settings can turn
+  notifications off).
+
+## Settings
+
+| Setting                       | Default  | What it does                                               |
+| ----------------------------- | -------- | ---------------------------------------------------------- |
+| Docker CLI path               | (empty)  | Where `docker` is, when it is not found on its own         |
+| Agent for “Ask agent”         | `claude` | Agent Orca starts with the log, such as `codex`            |
+| Notify when a container fails | on       | Desktop notifications from the status bar watcher          |
 
 ## Notes
 
 - **Docker binary.** Orca opened from the Dock gives plugins a short `PATH`, so the worker also
   looks in `/usr/local/bin`, `/opt/homebrew/bin`, Docker Desktop, OrbStack and Rancher Desktop.
-  Set **Settings → Plugins → Docker Logs → Docker CLI path** if yours is elsewhere.
-- **Telling projects apart.** Orca's plugin API gives the focused workspace's name and branch
-  but not its folder. When several workspaces share both (every repository's `main`), the worker
-  matches the focused workspace's terminals through `orca terminal list --json`; without a
-  terminal open there, pick the project in the panel.
+- **Telling projects apart.** Orca's plugin API gives the focused workspace's name and branch,
+  not its folder. When several workspaces share both (every repository's `main`), the worker
+  matches the focused workspace's terminals through `orca terminal list --json`.
 - **Local only.** Docker runs on this machine, so workspaces on SSH hosts are not listed.
-- **Safety.** The worker runs docker only in folders Orca lists as local workspaces, checks
-  service names and container ids, and never uses a shell. Log text is rendered as text.
+- **Safety.** The worker acts only in folders Orca lists as local workspaces, checks every
+  service name, container id and time it receives, never runs a shell for its own commands, and
+  quotes what it types into terminals. Log text is rendered as text.
+
+## Layout
+
+| File                 | What it does                                                               |
+| -------------------- | -------------------------------------------------------------------------- |
+| `orca-plugin.json`   | Manifest: panel, worker, status bar item, settings, capabilities, images   |
+| `src/worker.ts`      | Worker: panel requests, terminals, agent, status bar and notifications     |
+| `src/docker.ts`      | Finds and runs docker; parses `compose config`, `inspect`, `stats`, logs   |
+| `src/status.ts`      | Status bar summary and which container problems notify                     |
+| `src/workspaces.ts`  | Local workspaces with compose files; which one is focused                  |
+| `src/protocol.ts`    | Request and answer types shared by the panel and the worker                |
+| `panel/index.html`   | Panel markup and styles (Orca theme variables)                             |
+| `panel/main.ts`      | Panel logic: project, containers, actions, logs                            |
+| `panel/levels.ts`    | Error and warning detection                                                |
+| `panel/ansi.ts`      | ANSI colour codes to styled segments                                       |
+| `panel/icons.ts`     | The panel's icons                                                          |
 
 ## Develop
 
 ```sh
 orca plugin validate . --json
-orca plugin test . --json          # parsers, workspace resolution, worker over a fake docker
+orca plugin test . --json          # parsers, levels, status, worker over a fake docker
 orca plugin dev watch . --json     # load into Orca (asks for approval), stream logs and reloads
 ```
 

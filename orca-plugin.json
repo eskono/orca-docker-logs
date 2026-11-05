@@ -2,13 +2,37 @@
   "manifestVersion": 2,
   "id": "docker-logs",
   "name": "Docker Logs",
-  "version": "0.1.1",
-  "description": "Logs of the focused project's Docker Compose containers, with start, stop, restart and clear.",
+  "version": "0.2.0",
+  "description": "See your Docker Compose containers in Orca: live logs with error highlighting, CPU and memory, ports, start/stop/rebuild, a shell, and one click to hand a failing log to your agent.",
   "author": {
     "name": "Maksim Shevchuk"
   },
   "license": "MIT",
   "repository": "https://github.com/eskono/orca-docker-logs",
+  "icon": "assets/icon.png",
+  "cover": {
+    "path": "assets/cover.webp",
+    "alt": "Docker Logs: a sidebar panel listing Compose services with CPU, memory and ports above a live container log"
+  },
+  "screenshots": [
+    {
+      "path": "assets/screenshot-dark.webp",
+      "alt": "Docker Logs panel: Compose services with state, CPU, memory, ports and actions, above an api log with a traceback highlighted",
+      "caption": "Services with CPU, memory and ports; the selected container’s log with errors highlighted",
+      "theme": "dark"
+    },
+    {
+      "path": "assets/screenshot-light.webp",
+      "alt": "The same Docker Logs panel in a light theme",
+      "caption": "Services with CPU, memory and ports; the selected container’s log with errors highlighted",
+      "theme": "light"
+    },
+    {
+      "path": "assets/screenshot-all.webp",
+      "alt": "Two panels: every service’s log merged and tagged by container, and the same log filtered to errors only",
+      "caption": "All services in one log, and errors only, ready for Ask agent"
+    }
+  ],
   "engines": {
     "orca": ">=1.4.248"
   },
@@ -32,6 +56,34 @@
         "type": "string",
         "default": "",
         "placeholder": "/usr/local/bin/docker"
+      },
+      {
+        "key": "agent",
+        "title": "Agent for “Ask agent”",
+        "description": "Agent Orca starts with the log when you press Ask agent, such as claude or codex.",
+        "type": "string",
+        "default": "claude",
+        "placeholder": "claude"
+      },
+      {
+        "key": "notify",
+        "title": "Notify when a container fails",
+        "description": "Desktop notification when a container of the focused project crashes, keeps restarting or turns unhealthy.",
+        "type": "boolean",
+        "default": true
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "containers",
+        "text": "Docker",
+        "icon": "layers",
+        "tooltip": "Docker containers of the focused project"
+      }
+    ],
+    "events": [
+      {
+        "on": "workspace.changed"
       }
     ]
   },
@@ -44,6 +96,15 @@
     },
     {
       "kind": "settings:own"
+    },
+    {
+      "kind": "terminal:send"
+    },
+    {
+      "kind": "agent:launch"
+    },
+    {
+      "kind": "notifications:show"
     }
   ]
 }
