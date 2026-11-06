@@ -78,12 +78,30 @@
         list-style: none;
         margin: 0;
         padding: 4px;
-        max-height: 45%;
+        max-height: 60%;
         overflow-y: auto;
         flex: none;
         border-bottom: 1px solid var(--orca-border);
       }
       .services:empty { display: none; }
+      .docker-context { color: var(--orca-muted-foreground); font-size: 11px; overflow-wrap: anywhere; }
+      .compose-settings summary, .diagnostics summary { cursor: pointer; padding: 3px 0; }
+      .compose-settings form { display: grid; gap: 6px; padding: 6px 0; }
+      .compose-settings label { display: grid; gap: 3px; white-space: normal; }
+      .compose-settings textarea, .compose-settings input { width: 100%; min-width: 0; background: var(--orca-background); color: inherit; border: 1px solid var(--orca-border); border-radius: var(--radius); padding: 4px; }
+      .compose-settings textarea { resize: vertical; min-height: 45px; font-family: var(--mono); }
+      .hint { color: var(--orca-muted-foreground); font-size: 11px; white-space: normal; }
+      .services-resize { flex: none; height: 7px; cursor: row-resize; border-bottom: 1px solid var(--orca-border); }
+      .services-resize:hover, .services-resize:focus-visible { background: var(--orca-accent); }
+      .diagnostics { margin: 0 8px; flex: none; font-size: 11px; max-height: 150px; overflow: auto; }
+      .diagnostics.has-problem > summary { color: var(--bad); }
+      .diagnostics pre { margin: 4px 0 8px; font: 11px/1.4 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+      .repeat-count { font-weight: 700; color: var(--warn); }
+      .json-fields { margin: 2px 0; white-space: normal; font-family: var(--mono); }
+      .json-fields dl { display: grid; grid-template-columns: minmax(70px, auto) minmax(0, 1fr); gap: 2px 8px; margin: 4px 0; }
+      .json-fields dt { opacity: .7; overflow-wrap: anywhere; }
+      .json-fields dd { margin: 0; overflow-wrap: anywhere; }
+      .log-warning { color: var(--warn); }
       .service { display: flex; align-items: center; gap: 6px; padding-right: 4px; border-radius: var(--radius); }
       .service.selected { background: var(--orca-accent); color: var(--orca-accent-foreground); }
       .service:not(.selected):hover { background: var(--orca-muted); }
@@ -200,18 +218,38 @@
         <button id="project-restart" title="docker compose restart" disabled>Restart</button>
         <button id="project-down" title="docker compose down: stops and removes the containers" disabled>Down</button>
       </div>
+      <div id="docker-context" class="docker-context">Docker: loading…</div>
+      <details id="compose-settings" class="compose-settings">
+        <summary>Compose settings</summary>
+        <form id="compose-form">
+          <label>Compose files (one per line, relative to this workspace)
+            <textarea id="compose-files" placeholder="Automatic discovery, or e.g. infra/stack.yml"></textarea>
+          </label>
+          <label>Profiles for Up (comma-separated)
+            <input id="compose-profiles" placeholder="Compose defaults, or e.g. web, tools" />
+          </label>
+          <span id="available-profiles" class="hint"></span>
+          <div class="row"><button id="compose-apply" type="submit" disabled>Apply</button><button id="compose-defaults" type="button">Use defaults</button></div>
+        </form>
+      </details>
     </header>
     <div id="notice" class="notice" role="status" hidden></div>
     <ul id="services" class="services" aria-label="Containers"></ul>
+    <div id="services-resize" class="services-resize" tabindex="0" role="separator" aria-label="Resize service list" aria-orientation="horizontal" aria-valuemin="48" aria-valuemax="600" aria-valuenow="160"></div>
+    <details id="diagnostics" class="diagnostics" hidden>
+      <summary id="diagnostic-title">Container diagnostics</summary>
+      <div id="diagnostic-body"></div>
+    </details>
     <div class="logbar">
       <div class="row">
         <strong id="log-title" class="log-title">Logs</strong>
         <button id="ask" title="Start an agent with the lines shown and ask it to find the cause" disabled>Ask agent</button>
+        <button id="copy" title="Copy selected log text, or all visible lines" disabled>Copy</button>
         <button id="save" class="square" title="Save the lines shown to a file" aria-label="Save log" disabled></button>
         <button id="clear" class="square" title="Hide everything logged so far" aria-label="Clear log" disabled></button>
       </div>
       <div class="row">
-        <input id="filter" type="search" placeholder="Filter" aria-label="Filter log lines" />
+        <input id="filter" type="search" placeholder="Filter or trace_id=value" aria-label="Filter log lines" />
         <select id="level" aria-label="Level">
           <option value="all">All levels</option>
           <option value="warn">Warnings &amp; errors</option>
@@ -229,6 +267,8 @@
         <label><input id="follow" type="checkbox" checked /> Follow</label>
         <label><input id="timestamps" type="checkbox" /> Time</label>
         <label><input id="wrap" type="checkbox" checked /> Wrap</label>
+        <label><input id="group-errors" type="checkbox" /> Group errors</label>
+        <label><input id="json-fields" type="checkbox" /> JSON fields</label>
       </div>
       <div id="cleared" class="cleared" hidden>
         <span id="cleared-text"></span>

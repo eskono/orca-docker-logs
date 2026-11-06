@@ -1,5 +1,8 @@
 import { assert, test } from 'orca/testing'
-import { localOnly, normalizeBranch, resolveFocused } from './workspaces'
+import { hasComposeFile, localOnly, normalizeBranch, resolveFocused } from './workspaces'
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const ws = (id: string, name: string, path: string, branch: string | null) => ({ id, name, path, branch })
 const all = [
@@ -38,4 +41,12 @@ test('the focused terminals tell apart workspaces sharing a name and branch', as
   assert.equal((await resolveFocused(context, all, terminals))?.path, '/repos/web')
   assert.equal(await resolveFocused({ ...context, terminals: [] }, all, noTerminals), null)
   assert.equal(await resolveFocused({ ...context, terminals: [{ id: 'term_x' }] }, all, terminals), null)
+})
+
+test('discovers COMPOSE_FILE from dotenv and rejects an override file without a base', async () => {
+  const path = await mkdtemp(join(tmpdir(), 'compose-discovery-'))
+  await writeFile(join(path, 'compose.dev.yml'), 'services: {}')
+  assert.equal(await hasComposeFile(path), false)
+  await writeFile(join(path, '.env'), 'COMPOSE_FILE="stack.yml:overrides/dev.yml"\n')
+  assert.equal(await hasComposeFile(path), true)
 })

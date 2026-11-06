@@ -17,13 +17,15 @@ export function levelOf(text: string): Level {
 }
 
 /** Each line's level; indented lines right after an error or warning (a stack trace) share it. */
-export function levels(texts: string[]): Level[] {
-  let carried: Level = null
-  return texts.map((text) => {
+export function levels(texts: string[], sources: string[] = []): Level[] {
+  const carried = new Map<string, Level>()
+  return texts.map((text, i) => {
+    const source = sources[i] ?? ''
     const own = levelOf(text)
-    if (own) return (carried = own)
-    if (carried && /^\s+\S/.test(text)) return carried
-    return (carried = null)
+    if (own) { carried.set(source, own); return own }
+    if (carried.get(source) && /^\s+\S/.test(text)) return carried.get(source) ?? null
+    carried.delete(source)
+    return null
   })
 }
 

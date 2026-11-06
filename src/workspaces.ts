@@ -1,10 +1,11 @@
 // Which local workspaces have compose files, and which one is focused in Orca.
-import { readdir } from 'node:fs/promises'
+import { readFile, readdir } from 'node:fs/promises'
+import { join } from 'node:path'
 import { terminalPaths } from './orca-cli'
 import type { FocusContext, Workspace } from './protocol'
 
-/** compose.yaml, docker-compose.yml, compose.override.yaml, docker-compose.dev.yml, ... */
-const COMPOSE_FILE = /^(docker-)?compose(\.[\w.-]+)?\.ya?ml$/i
+/** Only base names Compose actually discovers without -f; overrides alone are not a project. */
+const COMPOSE_FILE = /^(docker-)?compose\.ya?ml$/i
 
 export type ListedWorkspace = Workspace & { hostId: string | null }
 
@@ -22,7 +23,11 @@ export function localOnly(workspaces: ListedWorkspace[]): Workspace[] {
 
 export async function hasComposeFile(path: string): Promise<boolean> {
   try {
-    return (await readdir(path)).some((name) => COMPOSE_FILE.test(name))
+    if ((await readdir(path)).some((name) => COMPOSE_FILE.test(name))) return true
+    if (process.env.COMPOSE_FILE) return true
+    const env = await readFile(join(path, '.env'), 'utf8').catch(() => '')
+    // Let Compose parse quoting, interpolation and multiple paths; discovery must not parse YAML or dotenv differently.
+    return /^\s*(?:export\s+)?COMPOSE_FILE\s*=/m.test(env)
   } catch {
     return false
   }

@@ -3,6 +3,11 @@
 /** A local Orca workspace (worktree or folder). */
 export type Workspace = { id: string; name: string; path: string; branch: string | null }
 
+/** Empty lists preserve Compose's normal file discovery and active profiles. */
+export type ComposeOptions = { files: string[]; profiles: string[] }
+export type DockerContext = { name: string; endpoint: string; remote: boolean }
+export type PortBinding = { port: number; containerPort: number; host: string }
+
 /** What `workspace.changed` / `workspace.readContext` report for the focused workspace. */
 export type FocusContext = {
   displayName: string
@@ -21,6 +26,9 @@ export type ServiceRow = {
   /** Docker state (`running`, `exited`, `restarting`, ...) or `not created`. */
   state: string
   exitCode: number | null
+  oomKilled: boolean
+  restartCount: number
+  stateError: string
   /** `healthy`, `unhealthy`, `starting` or empty. */
   health: string
   /** The last healthcheck's output while the container is not healthy. */
@@ -29,6 +37,7 @@ export type ServiceRow = {
   finishedAt: string | null
   /** Published TCP ports on this machine. */
   ports: number[]
+  portBindings: PortBinding[]
   /** Compose profiles the service belongs to; empty when it always runs. */
   profiles: string[]
   /** Whether the service builds its image (`build:` in the compose file). */
@@ -42,10 +51,18 @@ export type ContainerStats = { cpu: string; mem: string; memLimit: string; memPe
  * One log line: docker timestamp (RFC 3339, UTC), whether it came from stderr, the message, and
  * the container it came from when several are shown together.
  */
-export type LogLine = { t: string; e: boolean; m: string; src?: string }
+export type LogLine = { t: string; e: boolean; m: string; src?: string; containerId?: string }
 
 /** A container whose log to read, from `since` (RFC 3339) when given. */
-export type LogTarget = { service: string; containerId: string; name: string; since?: string }
+export type LogTarget = { service: string; containerId: string; name: string; since?: string; cursor?: string }
+
+export type LogAnswer = {
+  lines: LogLine[]
+  clearedAt: string | null
+  truncated: boolean
+  errors: { containerId: string; name: string; message: string }[]
+  limits: ('tail' | 'bytes')[]
+}
 
 /** Quick actions run in the background; `start` of a missing container and `build` open a terminal. */
 export type ServiceAction = 'start' | 'stop' | 'restart' | 'build'
@@ -59,7 +76,12 @@ export type Requests = {
     output: { workspaces: Workspace[]; focused: Workspace | null }
   }
   /** Compose services of a workspace (every profile) with their containers. */
-  'services.list': { input: { path: string; fresh?: boolean }; output: { project: string; rows: ServiceRow[] } }
+  'services.list': {
+    input: { path: string; fresh?: boolean }
+    output: { project: string; rows: ServiceRow[]; context: DockerContext; options: ComposeOptions; profiles: string[] }
+  }
+  'compose.get': { input: { path: string }; output: { options: ComposeOptions } }
+  'compose.set': { input: { path: string; options: ComposeOptions }; output: { options: ComposeOptions } }
   /** CPU and memory of running containers, keyed by container id. Takes a couple of seconds. */
   'stats.get': {
     input: { path: string; containerIds: string[] }
@@ -71,7 +93,7 @@ export type Requests = {
    */
   'logs.get': {
     input: { path: string; targets: LogTarget[] }
-    output: { lines: LogLine[]; clearedAt: string | null; truncated: boolean }
+    output: LogAnswer
   }
   /** Hides everything logged so far by these services (`reset: true` shows it again). */
   'logs.clear': {
@@ -97,7 +119,7 @@ export type Requests = {
   }
   /** Starts an agent in the workspace with these log lines and asks it to find the cause. */
   'agent.ask': {
-    input: { path: string; source: string; lines: string[] }
-    output: { terminalId: string; agent: string }
+    input: { path: string; source: string; lines: string[]; containerIds?: string[] }
+    output: { terminalId: string; agent: string; linesSent: number }
   }
 }

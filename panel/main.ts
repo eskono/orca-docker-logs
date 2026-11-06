@@ -2,6 +2,8 @@
 // of one container or of all of them.
 import type {
   ContainerStats,
+  ComposeOptions,
+  DockerContext,
   FocusContext,
   LogLine,
   LogTarget,
@@ -12,11 +14,17 @@ import type {
   Workspace
 } from '../src/protocol'
 import { problemOf } from '../src/status'
-import { parseAnsi, stripAnsi, type Style } from './ansi'
+import { diagnosticLines } from '../src/diagnostics'
+import { parseAnsi, type Style } from './ansi'
 import { icon, type IconName } from './icons'
-import { levels, levelToken, type Level } from './levels'
+import { levelToken } from './levels'
 import { findLinks, type LogLink } from './links'
 import { parseBytes, parsePercent, sparkPoints } from './sparkline'
+import { RequestGate } from './requests'
+import { LogBuffer } from './log-buffer'
+import { analyze, groupErrors, incidentLines, isCorrelation, matchesFilter, type Shown } from './log-model'
+import { reconcileLog } from './log-view'
+import { portAddress } from './ports'
 
 type Orca = {
   on(event: 'workspace.changed', handler: (payload: { context: FocusContext }) => void): unknown
@@ -24,7 +32,7 @@ type Orca = {
     request<K extends keyof Requests>(
       name: K,
       input: Requests[K]['input'],
-      options?: { timeoutMs?: number }
+      options?: { timeoutMs?: number; signal?: AbortSignal }
     ): Promise<Requests[K]['output']>
   }
   storage: { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void> }
@@ -64,7 +72,21 @@ const els = {
   cleared: $<HTMLDivElement>('cleared'),
   clearedText: $<HTMLSpanElement>('cleared-text'),
   showAll: $<HTMLButtonElement>('show-all'),
-  log: $<HTMLDivElement>('log')
+  log: $<HTMLDivElement>('log'),
+  context: $<HTMLDivElement>('docker-context'),
+  compose: $<HTMLDetailsElement>('compose-settings'),
+  composeForm: $<HTMLFormElement>('compose-form'),
+  composeFiles: $<HTMLTextAreaElement>('compose-files'),
+  composeProfiles: $<HTMLInputElement>('compose-profiles'),
+  availableProfiles: $<HTMLSpanElement>('available-profiles'),
+  composeApply: $<HTMLButtonElement>('compose-apply'),
+  diagnostics: $<HTMLDetailsElement>('diagnostics'),
+  diagnosticTitle: $<HTMLElement>('diagnostic-title'),
+  diagnosticBody: $<HTMLDivElement>('diagnostic-body'),
+  group: $<HTMLInputElement>('group-errors'),
+  json: $<HTMLInputElement>('json-fields'),
+  copy: $<HTMLButtonElement>('copy'),
+  resize: $<HTMLDivElement>('services-resize')
 }
 
 const state = {
@@ -89,15 +111,27 @@ const state = {
   projectBusy: null as ProjectAction | null,
   confirmDown: false,
   /** CPU and memory of running containers by container id, from the last `stats.get`. */
-  stats: {} as Record<string, ContainerStats>
+  stats: {} as Record<string, ContainerStats>,
+  dockerContext: { name: 'unknown', endpoint: '', remote: false } as DockerContext,
+  options: { files: [], profiles: [] } as ComposeOptions,
+  availableProfiles: [] as string[],
+  logWarnings: [] as string[],
+  limits: [] as string[]
 }
 /** The row last viewed in each project, picked again when the project comes back. */
 const lastSelection = new Map<string, { key: string; service: string | null }>()
-/** Bumped whenever the project or the shown log changes, so answers for the old one are dropped. */
+/** Log rendering scope: navigation and Clear must not reuse nodes from a previous selection. */
 let generation = 0
-let servicesInFlight = false
-let logsInFlight = false
-let statsInFlight = false
+const serviceRequests = new RequestGate()
+const logRequests = new RequestGate()
+const statRequests = new RequestGate()
+const focusRequests = new RequestGate()
+const configRequests = new RequestGate()
+const buffer = new LogBuffer()
+let sourceRevision = 0
+let pathRevision = 0
+let clearing = false
+let asking = false
 
 /** Resource samples per container, newest last, from each `stats.get` while the panel is open. */
 const HISTORY_SAMPLES = 60
@@ -341,13 +375,24 @@ function renderServices(): void {
       usageRow.append(el('span', 'usage', `${usage.cpu} ${usage.mem}`))
       side.append(usageRow)
     }
-    if (row.state === 'running' && row.ports.length) {
+    if (row.state === 'running' && row.portBindings.length) {
       const ports = el('span', 'ports')
-      for (const port of row.ports.slice(0, 4)) {
-        const link = el('button', 'port', `:${port}`)
-        link.title = `Open http://localhost:${port}`
-        link.addEventListener('click', () => void openUrl(`http://localhost:${port}`))
+      const seen = new Set<number>()
+      for (const binding of row.portBindings) {
+        if (seen.has(binding.port) || seen.size >= 4) continue
+        seen.add(binding.port)
+        const { address, url } = portAddress(binding, state.dockerContext)
+        const link = el('button', 'port', `:${binding.port}`)
+        link.title = `Copy ${address}`
+        link.addEventListener('click', () => void copyText(address))
         ports.append(link)
+        if (url) {
+          const open = el('button', 'port', '↗')
+          open.title = `Open ${url}`
+          open.setAttribute('aria-label', open.title)
+          open.addEventListener('click', () => void openUrl(url))
+          ports.append(open)
+        }
       }
       side.append(ports)
     }
@@ -361,6 +406,19 @@ function renderServices(): void {
   const all = renderAllRow()
   els.services.replaceChildren(...(all ? [all] : []), ...items)
   renderProjectActions()
+  renderDiagnostics()
+}
+
+function renderDiagnostics(): void {
+  const rows = showingAll() ? containers() : [selectedRow()].filter((row): row is ServiceRow => !!row)
+  els.diagnostics.hidden = rows.length === 0
+  const problems = rows.map((row) => problemOf(row)).filter(Boolean)
+  els.diagnosticTitle.textContent = problems.length ? `Diagnostics · ${problems.length} problem${problems.length === 1 ? '' : 's'}` : 'Container diagnostics'
+  els.diagnostics.classList.toggle('has-problem', problems.length > 0)
+  const content = rows.map((row) => el('pre', undefined, diagnosticLines(row).join('\n')))
+  els.diagnosticBody.replaceChildren(...content)
+  els.context.textContent = `Docker: ${state.dockerContext.name}${state.dockerContext.remote ? ' · remote' : ''}`
+  els.context.title = state.dockerContext.endpoint || 'Docker context could not be determined'
 }
 
 function styled(text: string, style: Style): Node {
@@ -380,28 +438,23 @@ function styled(text: string, style: Style): Node {
   return span
 }
 
-type Shown = { line: LogLine; text: string; level: Level }
-
 let levelCache: { lines: LogLine[]; shown: Shown[] } | null = null
 
 /** Every line with its plain text and level, computed once per answer from the worker. */
 function analyzed(): Shown[] {
   if (levelCache?.lines !== state.lines) {
-    const texts = state.lines.map((l) => stripAnsi(l.m))
-    const lineLevels = levels(texts)
-    levelCache = { lines: state.lines, shown: state.lines.map((line, i) => ({ line, text: texts[i], level: lineLevels[i] })) }
+    levelCache = { lines: state.lines, shown: analyze(state.lines) }
   }
   return levelCache.shown
 }
 
 /** The lines the level and filter let through. */
 function visibleLines(): Shown[] {
-  const filter = els.filter.value.trim().toLowerCase()
+  const filter = els.filter.value.trim()
   const level = els.level.value
-  return analyzed().filter(
-    ({ line, text, level: l }) =>
-      (level === 'all' || l === 'error' || (level === 'warn' && l === 'warn')) &&
-      (!filter || text.toLowerCase().includes(filter) || (line.src ?? '').toLowerCase().includes(filter))
+  return analyzed().filter((item) =>
+    (level === 'all' || item.level === 'error' || (level === 'warn' && item.level === 'warn')) &&
+    (!filter || matchesFilter(item, filter))
   )
 }
 
@@ -442,10 +495,11 @@ function linkified(text: string, wrap: (piece: string) => Node, service: string 
   return nodes
 }
 
-function renderLine({ line, level }: Shown, withTime: boolean, sourceWidth: number, service: string | null): HTMLElement {
+function renderLine({ line, level, fields, count }: Shown, withTime: boolean, sourceWidth: number, service: string | null): HTMLElement {
   const node = el('div', ['line', line.e ? 'err' : '', level ? `lvl-${level}` : ''].filter(Boolean).join(' '))
   if (withTime && line.t) node.append(el('span', 'ts', `${formatTime(line.t)} `))
   if (line.src) node.append(el('span', `src f${sourceColor(line.src)}`, `${line.src.padEnd(sourceWidth)} │ `))
+  if (count > 1) node.append(el('span', 'repeat-count', `×${count} `))
   const segments = parseAnsi(line.m)
   const plain = (piece: string) => document.createTextNode(piece)
   if (segments.every((s) => Object.keys(s.style).length === 0)) {
@@ -466,6 +520,25 @@ function renderLine({ line, level }: Shown, withTime: boolean, sourceWidth: numb
     for (const segment of segments) node.append(...linkified(segment.text, (piece) => styled(piece, segment.style), service))
   }
   if (node.childNodes.length === 0) node.append('​') // keep empty lines one line tall
+  if (els.json.checked && fields) {
+    const details = el('details', 'json-fields')
+    details.append(el('summary', undefined, 'JSON fields'))
+    const list = el('dl')
+    for (const [key, value] of Object.entries(fields)) {
+      list.append(el('dt', undefined, key))
+      const entry = el('dd')
+      const text = typeof value === 'string' ? value : JSON.stringify(value)
+      if (isCorrelation(key) && typeof value !== 'object') {
+        const filter = el('button', 'link', text)
+        filter.title = `Filter by ${key}`
+        filter.addEventListener('click', () => { els.filter.value = `${key}=${JSON.stringify(String(value))}`; renderLog(true) })
+        entry.append(filter)
+      } else entry.textContent = text
+      list.append(entry)
+    }
+    details.append(list)
+    node.append(details)
+  }
   return node
 }
 
@@ -485,32 +558,39 @@ function renderLog(scrollToEnd = false): void {
   const row = selectedRow()
   const hasLog = showingAll() ? containers().length > 0 : !!row?.containerId
   els.logTitle.textContent = showingAll() ? 'Logs · all services' : row ? `Logs · ${row.name}` : 'Logs'
-  els.clear.disabled = !hasLog
+  els.clear.disabled = !hasLog || clearing
+  els.showAll.disabled = clearing
   els.cleared.hidden = !state.clearedAt
   els.clearedText.textContent = state.clearedAt ? `Lines before ${formatTime(state.clearedAt)} are hidden.` : ''
   pane.classList.toggle('wrap', els.wrap.checked)
-
-  const fragment = document.createDocumentFragment()
+  const entries: { key: string; create: () => HTMLElement }[] = []
   const placeholder = logPlaceholder()
   const shown = placeholder ? [] : visibleLines()
-  if (placeholder) {
-    fragment.append(el('div', 'placeholder', placeholder))
-  } else {
-    const filtered = els.filter.value.trim() !== '' || els.level.value !== 'all'
-    if (state.truncated && !filtered) fragment.append(el('div', 'placeholder', 'Older lines are not shown.'))
-    const withTime = els.timestamps.checked
-    const sourceWidth = Math.max(0, ...shown.map((s) => s.line.src?.length ?? 0))
-    const serviceByName = new Map(state.rows.map((r) => [r.name, r.service]))
-    const selected = selectedRow()?.service ?? null
-    for (const item of shown) {
-      const service = item.line.src ? serviceByName.get(item.line.src) ?? null : selected
-      fragment.append(renderLine(item, withTime, sourceWidth, service))
+  if (placeholder) entries.push({ key: `placeholder:${placeholder}`, create: () => el('div', 'placeholder', placeholder) })
+  else {
+    if (state.truncated) {
+      const text = `Partial history: older lines were omitted (${state.limits.join(', ') || 'history limit'}). Save and Ask agent use the loaded lines.`
+      entries.push({ key: text, create: () => el('div', 'placeholder', text) })
     }
-    if (!shown.length) fragment.append(el('div', 'placeholder', filtered ? 'No lines match.' : 'No log lines yet.'))
+    for (const warning of state.logWarnings) entries.push({ key: `warning:${warning}`, create: () => el('div', 'placeholder log-warning', warning) })
+    const records = els.group.checked ? groupErrors(shown) : shown
+    const sourceWidth = Math.max(0, ...records.map((item) => item.line.src?.length ?? 0))
+    const serviceByName = new Map(state.rows.map((r) => [r.name, r.service]))
+    const serviceById = new Map(state.rows.map((r) => [r.containerId, r.service]))
+    for (const item of records) {
+      const service = item.line.containerId ? serviceById.get(item.line.containerId) ?? null : item.line.src ? serviceByName.get(item.line.src) ?? null : row?.service ?? null
+      const key = JSON.stringify([item.line, item.level, item.count, els.timestamps.checked, els.json.checked, sourceWidth, sourceRevision, generation, service])
+      entries.push({ key, create: () => renderLine(item, els.timestamps.checked, sourceWidth, service) })
+    }
+    if (!records.length) {
+      const text = els.filter.value.trim() || els.level.value !== 'all' ? 'No lines match.' : 'No log lines yet.'
+      entries.push({ key: text, create: () => el('div', 'placeholder', text) })
+    }
   }
-  els.ask.disabled = shown.length === 0
+  els.ask.disabled = asking || shown.length === 0
   els.save.disabled = shown.length === 0
-  pane.replaceChildren(fragment)
+  els.copy.disabled = shown.length === 0
+  reconcileLog(pane, entries)
   if (scrollToEnd || (els.follow.checked && atEnd)) pane.scrollTop = pane.scrollHeight
   if (unresolved.size) void resolveSources()
 }
@@ -520,6 +600,7 @@ async function resolveSources(): Promise<void> {
   const path = state.path
   if (!path || resolving || !unresolved.size) return
   resolving = true
+  const revision = pathRevision
   const batch = [...unresolved].map(([service, files]) => [service, [...files].slice(0, 200)] as const)
   unresolved.clear()
   try {
@@ -530,13 +611,15 @@ async function resolveSources(): Promise<void> {
       } catch {
         // Unknown stays text; not asking again keeps a failing worker from being called every render.
       }
-      if (path !== state.path) return
+      if (path !== state.path || revision !== pathRevision) return
+      sourceRevision++
       for (const file of files) sources.set(`${service}\0${file}`, found[file] ?? null)
     }
   } finally {
     resolving = false
+    if (unresolved.size) queueMicrotask(() => void resolveSources())
   }
-  renderLog()
+  if (revision === pathRevision) renderLog()
 }
 
 // ---------- data ----------
@@ -551,10 +634,10 @@ function projectHint(): string | null {
 }
 
 async function refreshWorkspaces(): Promise<void> {
+  const ticket = focusRequests.begin(true)!
   try {
-    const { workspaces, focused } = await orca.plugin.request('workspaces.list', { context: state.context })
-    // `workspace.changed` also fires when terminals open or close: follow focus only when it
-    // moved, so a project picked by hand stays until then.
+    const { workspaces, focused } = await orca.plugin.request('workspaces.list', { context: state.context }, { signal: ticket.signal })
+    if (!focusRequests.current(ticket)) return
     const focusMoved = focused?.path !== state.focused?.path
     state.workspaces = workspaces
     state.focused = focused
@@ -565,32 +648,98 @@ async function refreshWorkspaces(): Promise<void> {
     if (next !== state.path) setPath(next)
     else if (!state.notice?.error) setNotice(projectHint())
   } catch (error) {
-    setNotice(errorText(error), true)
-  }
+    if (focusRequests.current(ticket)) setNotice(errorText(error), true)
+  } finally { focusRequests.finish(ticket) }
 }
 
+function resetLogs(): void {
+  generation++
+  logRequests.invalidate()
+  buffer.reset()
+  state.lines = []
+  state.clearedAt = null
+  state.truncated = false
+  state.logError = null
+  state.logWarnings = []
+  state.limits = []
+}
+let clearOperation = 0
+let projectOperation = 0
 function setPath(path: string | null): void {
   state.path = path
+  pathRevision++
+  clearOperation++
+  projectOperation++
+  clearing = false
+  state.projectBusy = null
+  state.busy.clear()
+  for (const lane of [serviceRequests, statRequests, configRequests]) lane.invalidate()
+  resetLogs()
   setNotice(projectHint())
   state.project = ''
   state.rows = []
   state.servicesLoaded = false
+  state.options = { files: [], profiles: [] }
+  state.availableProfiles = []
+  state.dockerContext = { name: 'loading…', endpoint: '', remote: false }
   const last = path ? lastSelection.get(path) : undefined
   state.key = last?.key ?? null
   state.service = last?.service ?? null
-  state.lines = []
-  state.clearedAt = null
-  state.logError = null
   state.stats = {}
   history.clear()
   sources.clear()
   unresolved.clear()
+  sourceRevision++
   state.confirmDown = false
-  generation++
+  clearTimeout(downTimer)
+  els.composeFiles.value = ''
+  els.composeProfiles.value = ''
+  els.availableProfiles.textContent = ''
+  els.composeApply.disabled = !path
   renderWorkspaces()
   renderServices()
   renderLog(true)
+  if (path) void loadComposeOptions()
   void loadServices()
+}
+
+async function loadComposeOptions(): Promise<void> {
+  const path = state.path
+  if (!path) return
+  const ticket = configRequests.begin(true)!
+  try {
+    const { options } = await orca.plugin.request('compose.get', { path }, { signal: ticket.signal })
+    if (!configRequests.current(ticket)) return
+    state.options = options
+    els.composeFiles.value = options.files.join('\n')
+    els.composeProfiles.value = options.profiles.join(', ')
+  } catch (error) {
+    if (configRequests.current(ticket)) setNotice(`Could not read Compose settings: ${errorText(error)}`, true)
+  } finally { configRequests.finish(ticket) }
+}
+
+async function applyCompose(event: Event): Promise<void> {
+  event.preventDefault()
+  const path = state.path
+  if (!path) return
+  const ticket = configRequests.begin(true)!
+  els.composeApply.disabled = true
+  const options = {
+    files: els.composeFiles.value.split('\n').map((file) => file.trim()).filter(Boolean),
+    profiles: els.composeProfiles.value.split(',').map((profile) => profile.trim()).filter(Boolean)
+  }
+  try {
+    await orca.plugin.request('compose.set', { path, options }, { timeoutMs: 60_000, signal: ticket.signal })
+    if (!configRequests.current(ticket)) return
+    setPath(path)
+    setNotice('Compose settings saved for this workspace.')
+    void refreshWorkspaces()
+  } catch (error) {
+    if (configRequests.current(ticket)) setNotice(`Could not apply Compose settings: ${errorText(error)}`, true)
+  } finally {
+    if (configRequests.current(ticket)) els.composeApply.disabled = false
+    configRequests.finish(ticket)
+  }
 }
 
 function pickKey(rows: ServiceRow[]): { key: string; service: string | null } | null {
@@ -606,62 +755,64 @@ function pickKey(rows: ServiceRow[]): { key: string; service: string | null } | 
 
 async function loadServices(fresh = false): Promise<void> {
   const path = state.path
-  if (!path || servicesInFlight) return
-  servicesInFlight = true
-  const at = generation
+  if (!path) return
+  const ticket = serviceRequests.begin(fresh)
+  if (!ticket) return
   try {
-    const { project, rows } = await orca.plugin.request('services.list', { path, fresh })
-    if (path !== state.path) return
-    state.project = project
-    state.rows = rows
+    const answer = await orca.plugin.request('services.list', { path, fresh }, { timeoutMs: 70_000, signal: ticket.signal })
+    if (!serviceRequests.current(ticket)) return
+    const beforeTargets = JSON.stringify(logTargets().map((target) => target.containerId))
+    const contextChanged = state.dockerContext.name !== answer.context.name || state.dockerContext.endpoint !== answer.context.endpoint
+    state.project = answer.project
+    state.rows = answer.rows
+    state.dockerContext = answer.context
+    state.availableProfiles = answer.profiles
+    els.availableProfiles.textContent = answer.profiles.length ? `Available profiles: ${answer.profiles.join(', ')}` : 'No optional profiles'
     const firstLoad = !state.servicesLoaded
     state.servicesLoaded = true
     if (state.notice?.error) setNotice(null)
-    if (firstLoad) void loadStats()
-    const pick = pickKey(rows)
+    if (contextChanged) { history.clear(); state.stats = {}; statRequests.invalidate() }
+    const pick = pickKey(answer.rows)
     if (pick && pick.key !== state.key) selectKey(pick.key, pick.service)
     else {
+      const changed = beforeTargets !== JSON.stringify(logTargets().map((target) => target.containerId))
+      if (changed || contextChanged) resetLogs()
       renderServices()
-      if (at === generation) renderLog()
+      renderLog()
+      if (firstLoad || changed || contextChanged) void loadLogs(true)
     }
+    if (firstLoad || contextChanged) void loadStats()
+    const ids = new Set(answer.rows.map((row) => row.containerId))
+    for (const id of history.keys()) if (!ids.has(id)) history.delete(id)
   } catch (error) {
-    if (path !== state.path) return
-    state.rows = []
+    if (!serviceRequests.current(ticket)) return
     state.servicesLoaded = true
     renderServices()
     setNotice(errorText(error), true)
+    els.compose.open = true
     renderLog()
-  } finally {
-    servicesInFlight = false
-  }
+  } finally { serviceRequests.finish(ticket) }
 }
 
-/** Best effort: a failed sample (a container that just stopped, say) leaves the numbers out until the next. */
 async function loadStats(): Promise<void> {
   const path = state.path
-  const containerIds = state.rows.flatMap((r) => (r.containerId && r.state === 'running' ? [r.containerId] : []))
-  if (!path || statsInFlight) return
-  if (!containerIds.length) {
-    state.stats = {}
-    return
-  }
-  statsInFlight = true
+  const containerIds = state.rows.flatMap((row) => row.containerId && row.state === 'running' ? [row.containerId] : [])
+  if (!path) return
+  const ticket = statRequests.begin()
+  if (!ticket) return
   try {
-    const { stats } = await orca.plugin.request('stats.get', { path, containerIds }, { timeoutMs: 45_000 })
-    if (path !== state.path) return
+    if (!containerIds.length) { state.stats = {}; return }
+    const { stats } = await orca.plugin.request('stats.get', { path, containerIds }, { timeoutMs: 45_000, signal: ticket.signal })
+    if (!statRequests.current(ticket)) return
     state.stats = stats
     for (const [id, usage] of Object.entries(stats)) {
-      const cpu = parsePercent(usage.cpu)
-      const mem = parseBytes(usage.mem)
+      const cpu = parsePercent(usage.cpu), mem = parseBytes(usage.mem)
       if (cpu !== null && mem !== null) history.set(id, [...(history.get(id) ?? []), { cpu, mem }].slice(-HISTORY_SAMPLES))
     }
+    renderServices()
   } catch {
-    if (path !== state.path) return
-    state.stats = {}
-  } finally {
-    statsInFlight = false
-  }
-  renderServices()
+    if (statRequests.current(ticket)) { state.stats = {}; renderServices() }
+  } finally { statRequests.finish(ticket) }
 }
 
 function selectKey(key: string, service: string | null): void {
@@ -671,11 +822,7 @@ function selectKey(key: string, service: string | null): void {
   if (state.path) lastSelection.set(state.path, { key, service })
   renderServices()
   if (same) return
-  state.lines = []
-  state.clearedAt = null
-  state.truncated = false
-  state.logError = null
-  generation++
+  resetLogs()
   renderLog(true)
   void loadLogs(true)
 }
@@ -697,34 +844,38 @@ function logTargets(): LogTarget[] {
 }
 
 function sameLines(a: LogLine[], b: LogLine[]): boolean {
-  if (a.length !== b.length) return false
-  if (!a.length) return true
-  const [a0, b0, a1, b1] = [a[0], b[0], a[a.length - 1], b[b.length - 1]]
-  return a0.t === b0.t && a0.m === b0.m && a1.t === b1.t && a1.m === b1.m && a1.src === b1.src
+  return a.length === b.length && a.every((line, i) => {
+    const other = b[i]
+    return line.t === other.t && line.m === other.m && line.e === other.e && line.src === other.src && line.containerId === other.containerId
+  })
 }
 
 async function loadLogs(force = false): Promise<void> {
   const path = state.path
-  const targets = logTargets()
-  if (!path || !targets.length || (logsInFlight && !force)) return
-  logsInFlight = true
-  const at = generation
+  const baseTargets = logTargets()
+  if (!path || !baseTargets.length || clearing) return
+  const ticket = logRequests.begin(force)
+  if (!ticket) return
+  const targets = force ? baseTargets : buffer.targets(baseTargets)
   try {
-    const answer = await orca.plugin.request('logs.get', { path, targets })
-    if (at !== generation) return
-    const changed = !sameLines(answer.lines, state.lines) || answer.clearedAt !== state.clearedAt || state.logError !== null
-    state.lines = answer.lines
-    state.clearedAt = answer.clearedAt
-    state.truncated = answer.truncated
+    const answer = await orca.plugin.request('logs.get', { path, targets }, { timeoutMs: 60_000, signal: ticket.signal })
+    if (!logRequests.current(ticket)) return
+    buffer.apply(answer, baseTargets, !force, els.window.value === 'tail')
+    const warnings = buffer.errors.map((error) => `${error.name}: ${error.message}`)
+    const limits = [...buffer.limits]
+    const changed = !sameLines(buffer.lines, state.lines) || state.clearedAt !== buffer.clearedAt || state.truncated !== buffer.truncated || state.logError !== null || JSON.stringify(warnings) !== JSON.stringify(state.logWarnings) || JSON.stringify(limits) !== JSON.stringify(state.limits)
+    state.lines = buffer.lines
+    state.clearedAt = buffer.clearedAt
+    state.truncated = buffer.truncated
+    state.logWarnings = warnings
+    state.limits = limits
     state.logError = null
     if (changed || force) renderLog(force)
   } catch (error) {
-    if (at !== generation) return
+    if (!logRequests.current(ticket)) return
     state.logError = errorText(error)
     renderLog()
-  } finally {
-    logsInFlight = false
-  }
+  } finally { logRequests.finish(ticket) }
 }
 
 function openedTerminal(what: string): void {
@@ -733,7 +884,8 @@ function openedTerminal(what: string): void {
 
 async function act(row: ServiceRow, action: ServiceAction): Promise<void> {
   const path = state.path
-  if (!path) return
+  const revision = pathRevision
+  if (!path || state.busy.has(row.key)) return
   state.busy.add(row.key)
   renderServices()
   try {
@@ -742,16 +894,17 @@ async function act(row: ServiceRow, action: ServiceAction): Promise<void> {
       { path, service: row.service, containerId: row.containerId, action },
       { timeoutMs: 70_000 }
     )
+    if (revision !== pathRevision) return
     if (terminalId) openedTerminal(`docker compose up${action === 'build' ? ' --build' : ''} ${row.service}`)
     else setNotice(null)
   } catch (error) {
+    if (revision !== pathRevision) return
     const verb = { start: 'Start', stop: 'Stop', restart: 'Restart', build: 'Rebuild' }[action]
     setNotice(`${verb} ${row.service} failed: ${errorText(error)}`, true)
   } finally {
-    state.busy.delete(row.key)
-    renderServices()
+    if (revision === pathRevision) { state.busy.delete(row.key); renderServices() }
   }
-  if (path !== state.path) return
+  if (revision !== pathRevision) return
   await loadServices()
   await loadLogs(true)
 }
@@ -771,19 +924,21 @@ async function projectAct(action: ProjectAction): Promise<void> {
   }
   clearTimeout(downTimer)
   state.confirmDown = false
+  const operation = ++projectOperation
   state.projectBusy = action
   renderProjectActions()
   try {
     const { terminalId } = await orca.plugin.request('project.action', { path, action }, { timeoutMs: 120_000 })
+    if (operation !== projectOperation) return
     if (terminalId) openedTerminal('docker compose up -d')
     else setNotice(action === 'down' ? 'Containers stopped and removed.' : 'Containers restarted.')
   } catch (error) {
+    if (operation !== projectOperation) return
     setNotice(`docker compose ${action} failed: ${errorText(error)}`, true)
   } finally {
-    state.projectBusy = null
-    renderProjectActions()
+    if (operation === projectOperation) { state.projectBusy = null; renderProjectActions() }
   }
-  if (path !== state.path) return
+  if (operation !== projectOperation) return
   await loadServices()
   await loadLogs(true)
 }
@@ -824,18 +979,60 @@ function logSource(): string {
 
 async function askAgent(): Promise<void> {
   const path = state.path
+  const revision = pathRevision
   const shown = visibleLines()
-  if (!path || !shown.length) return
-  const lines = shown.map(({ line, text }) => `${line.t.slice(11, 23)} ${line.src ? `${line.src} | ` : ''}${text}`)
+  if (!path || !shown.length || asking) return
+  const incident = incidentLines(analyzed(), shown)
+  const lines: string[] = []
+  let chars = 0
+  for (const { line, text } of incident) {
+    const formatted = `${line.t} ${line.src ? `${line.src} | ` : ''}${text}`.slice(0, 23_999)
+    if (chars + formatted.length + 1 > 24_000) break
+    lines.push(formatted); chars += formatted.length + 1
+  }
+  const containerIds = [...new Set(incident.flatMap((item) => item.line.containerId ? [item.line.containerId] : []))]
+  asking = true
   els.ask.disabled = true
   try {
-    const { agent } = await orca.plugin.request('agent.ask', { path, source: logSource(), lines })
-    setNotice(`Started ${agent} with the last ${Math.min(lines.length, 300)} log lines.`)
+    const { agent, linesSent } = await orca.plugin.request('agent.ask', { path, source: logSource(), lines, containerIds }, { timeoutMs: 70_000 })
+    if (revision === pathRevision) setNotice(`Started ${agent} with ${linesSent} log lines, surrounding context and container diagnostics.`)
   } catch (error) {
-    setNotice(`Could not start the agent: ${errorText(error)}`, true)
-  } finally {
-    els.ask.disabled = false
-  }
+    if (revision === pathRevision) setNotice(`Could not start the agent: ${errorText(error)}`, true)
+  } finally { asking = false; renderLog() }
+}
+
+async function copyText(text: string): Promise<void> {
+  try {
+    let copied = false
+    try {
+      if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); copied = true }
+    } catch { /* Some embedded frames expose the Clipboard API but deny it; try the selection API. */ }
+    if (!copied) {
+      const active = document.activeElement as HTMLElement | null
+      const selection = window.getSelection()
+      const ranges = selection ? Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i).cloneRange()) : []
+      const area = el('textarea')
+      area.value = text
+      area.style.position = 'fixed'
+      area.style.opacity = '0'
+      document.body.append(area)
+      try { area.select(); copied = document.execCommand('copy') }
+      finally {
+        area.remove()
+        active?.focus()
+        selection?.removeAllRanges()
+        for (const range of ranges) selection?.addRange(range)
+      }
+      if (!copied) throw new Error('Clipboard is unavailable')
+    }
+    setNotice('Copied to clipboard.')
+  } catch (error) { setNotice(`Could not copy: ${errorText(error)}`, true) }
+}
+
+function copyLog(): void {
+  const selection = window.getSelection()
+  const selected = selection && selection.anchorNode && selection.focusNode && els.log.contains(selection.anchorNode) && els.log.contains(selection.focusNode) ? selection.toString() : ''
+  void copyText(selected || visibleLines().map(({ line, text }) => `${line.t} ${line.src ? `${line.src} | ` : ''}${text}`).join('\n'))
 }
 
 async function saveLog(): Promise<void> {
@@ -852,29 +1049,38 @@ async function saveLog(): Promise<void> {
 }
 
 async function clearLogs(reset: boolean): Promise<void> {
-  const services = [...new Set(logTargets().map((t) => t.service))]
-  if (!state.path || !services.length) return
+  const path = state.path
+  const services = [...new Set(logTargets().map((target) => target.service))]
+  if (!path || !services.length || clearing) return
+  const operation = ++clearOperation
+  resetLogs()
+  clearing = true
+  renderLog(true)
   try {
-    const { clearedAt } = await orca.plugin.request('logs.clear', { path: state.path, services, reset })
+    const { clearedAt } = await orca.plugin.request('logs.clear', { path, services, reset })
+    if (operation !== clearOperation) return
     state.clearedAt = clearedAt
-    if (!reset) state.lines = []
-    state.truncated = false
+    clearing = false
     renderLog(true)
     await loadLogs(true)
   } catch (error) {
-    setNotice(errorText(error), true)
+    if (operation === clearOperation) setNotice(errorText(error), true)
+  } finally {
+    if (operation === clearOperation) { clearing = false; renderLog() }
   }
 }
 
 // ---------- preferences ----------
 
 const PREFS_KEY = 'prefs'
-const checkboxes = { follow: els.follow, timestamps: els.timestamps, wrap: els.wrap }
+const checkboxes = { follow: els.follow, timestamps: els.timestamps, wrap: els.wrap, group: els.group, json: els.json }
+let servicesHeight: number | null = null
 const selects = { level: els.level, window: els.window }
 
 async function loadPrefs(): Promise<void> {
   try {
     const prefs = (await orca.storage.get(PREFS_KEY)) as Record<string, unknown> | null
+    if (typeof prefs?.servicesHeight === 'number') setServicesHeight(prefs.servicesHeight)
     for (const [name, input] of Object.entries(checkboxes)) {
       if (typeof prefs?.[name] === 'boolean') input.checked = prefs[name] as boolean
     }
@@ -889,17 +1095,44 @@ async function loadPrefs(): Promise<void> {
 
 function savePrefs(): void {
   const prefs = {
+    servicesHeight,
     ...Object.fromEntries(Object.entries(checkboxes).map(([name, input]) => [name, input.checked])),
     ...Object.fromEntries(Object.entries(selects).map(([name, select]) => [name, select.value]))
   }
   void orca.storage.set(PREFS_KEY, prefs).catch(() => undefined)
 }
 
+function setServicesHeight(height: number): void {
+  const maximum = Math.max(80, (document.body.clientHeight || 600) * 0.6)
+  servicesHeight = Math.round(Math.max(48, Math.min(height, maximum)))
+  els.services.style.height = `${servicesHeight}px`
+  els.resize.setAttribute('aria-valuenow', String(servicesHeight))
+  els.resize.setAttribute('aria-valuemax', String(Math.round(maximum)))
+}
+els.resize.addEventListener('keydown', (event) => {
+  if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return
+  event.preventDefault()
+  setServicesHeight((servicesHeight ?? els.services.getBoundingClientRect().height) + (event.key === 'ArrowDown' ? 16 : -16))
+  savePrefs()
+})
+els.resize.addEventListener('pointerdown', (event) => {
+  event.preventDefault()
+  const top = els.services.getBoundingClientRect().top
+  const move = (pointer: PointerEvent) => setServicesHeight(pointer.clientY - top)
+  const end = () => { document.removeEventListener('pointermove', move); document.removeEventListener('pointerup', end); document.removeEventListener('pointercancel', end); savePrefs() }
+  document.addEventListener('pointermove', move)
+  document.addEventListener('pointerup', end)
+  document.addEventListener('pointercancel', end)
+})
+
 // ---------- wiring ----------
 
 els.refresh.append(icon('restart'))
 els.save.append(icon('save'))
 els.clear.append(icon('clear'))
+els.copy.addEventListener('click', copyLog)
+els.composeForm.addEventListener('submit', (event) => void applyCompose(event))
+$('compose-defaults').addEventListener('click', () => { els.composeFiles.value = ''; els.composeProfiles.value = ''; els.composeForm.requestSubmit() })
 els.ask.prepend(icon('agent'))
 els.workspace.addEventListener('change', () => setPath(els.workspace.value || null))
 els.refresh.addEventListener('click', () => {
@@ -921,8 +1154,7 @@ els.level.addEventListener('change', () => {
 })
 els.window.addEventListener('change', () => {
   savePrefs()
-  generation++
-  state.lines = []
+  resetLogs()
   renderLog(true)
   void loadLogs(true)
 })

@@ -15,13 +15,23 @@ asks you to approve full access.
 - **Services from the compose files.** The worker asks `docker compose config` in the workspace
   folder, so Compose picks the files the way it does in a terminal (`compose.yaml` /
   `docker-compose.yml`, their `.override`, `COMPOSE_FILE` from `.env`). Services of every
-  profile are listed; one that never ran shows its profile and starts with it.
+  profile are listed; one that never ran shows its profile and starts with it. **Compose settings**
+  selects custom files (one workspace-relative path per line) and profiles for Up. Settings are
+  checked before saving and belong to that workspace. Custom files keep the workspace's `.env`
+  when present, unless `COMPOSE_ENV_FILES` or `COMPOSE_DISABLE_ENV_FILE` overrides dotenv use.
+  Build/bind paths still resolve from the first Compose file. Empty fields restore Compose defaults.
 - **State at a glance.** A dot per container (running, starting, unhealthy, crashed), uptime,
   CPU and memory from `docker stats` with a small chart of the last minutes (line: CPU, dashes:
-  memory), and the published ports as links that open `http://localhost:<port>`. Hover a row
-  for the last health check output, the memory limit and the CPU and memory range.
+  memory). Click a published port to copy its address; the adjacent arrow opens recognized web
+  ports using HTTP or HTTPS. Database ports are addresses to copy. Hover a row for the last
+  health check output, the memory limit and the CPU and memory range.
+- **Diagnostics.** Expand the selected container's diagnostics to see its exit code, OOM-kill
+  flag, restart count, runtime error, last health check and start/finish times. The Docker context
+  is shown above the services, with the endpoint in its tooltip and a label for remote daemons.
 - **The project follows Orca's focus.** The picker at the top lists every local workspace with a
-  compose file, to look at another one.
+  compose file or saved configuration, to look at another one. The focused local workspace is
+  also listed when it has no automatically discovered file, so custom files can be configured.
+  Drag the divider below the services, or focus it and use the arrow keys, to resize the list.
 - **Actions.** Per container: shell (`docker exec -it … bash`, or `sh`), rebuild
   (`compose up -d --build`), restart, stop, start. For the project: Up, Restart and Down (Down
   asks for a second click). Commands that may build or pull (Up, rebuild, creating a container)
@@ -30,19 +40,43 @@ asks you to approve full access.
   ANSI colours. Errors and warnings are highlighted in plain, logfmt and JSON logs, stack traces
   included; the level picker shows only them. Periods: the last 1000 lines, 5 or 15 minutes, an
   hour, or since the container started. Filter, timestamps, wrap, and **Save** to a file.
-  Programs that print no colours under Docker still get their level word coloured.
+  Programs that print no colours under Docker still get their level word coloured. **Copy** uses
+  your selected log text, or all visible lines when nothing is selected. Polling keeps unchanged
+  line elements, so new messages do not discard text selection.
+- **Structured logs and repeated errors.** **JSON fields** expands object fields, including nested
+  fields. Filter with `trace_id=abc`, `request.id=42`, or `trace_id="two words"`; multiple terms
+  are combined. Click a request/trace/correlation ID in the field view to filter by it. **Group
+  errors** collapses identical error/warning records from the same container, keeps a representative
+  stack trace and shows a repetition count. Save and Copy without a selection still export the
+  original visible lines, including repetitions.
 - **Stack traces open the code.** Paths in Python, Node, Go, Ruby and PHP traces that belong to
   the project are links: a click opens the file at that line in Orca's editor. Container paths
   map to the project through the service's bind mounts (`./app:/srv/app`), or, for code copied
   into the image, by the longest part of the path that exists in the project; library frames
   stay plain text. Web addresses in the log are links too.
 - **Ask agent** starts the agent set in Settings (Claude by default) in the project's workspace
-  with the lines you are looking at, and asks it to find the cause.
+  with the latest visible error/warning and surrounding unfiltered lines from that container.
+  The worker adds fresh container diagnostics, the Docker context and Compose settings, and asks
+  the agent to find the cause. Context is bounded to 300 log lines / 24,000 characters; the prompt
+  reports the included count and treats log content as evidence rather than instructions.
 - **Clear** hides what was logged so far (it remembers the time and asks `docker logs --since`);
   Docker's log is not touched, so **Show all** brings it back.
 - **Status bar.** `running/total` for the focused project, red when a container crashed, keeps
   restarting or turns unhealthy, with a desktop notification when that happens (Settings can turn
-  notifications off).
+  notifications off). OOM kills and unexpected increases in restart count are included.
+
+## Log history and limits
+
+Logs are polled every two seconds while Follow is enabled and the panel is visible. Later polls
+use a cursor per container, including Docker's nanoseconds; overlapping boundary lines are
+deduplicated without removing genuine repeated lines. Docker operations share a four-process budget.
+
+The tail view retains the newest 1000 lines across the selected containers. Time windows and
+Since start initially read up to 5000 lines per container; subsequent polls use the same cap for
+new data. The panel retains up to 10,000 lines / approximately 1.8 million characters for those
+views. Replies stay below the IPC size budget. **Partial history** identifies omitted lines due
+to tail, reply or panel-buffer limits, including when a filter is active; it is not a full-history
+export. If one container disappears during rebuild, its error appears alongside the other logs.
 
 ## Settings
 
@@ -60,10 +94,15 @@ asks you to approve full access.
   folder, opens terminals in the background and opens files without a line. The worker uses the
   `orca` CLI for those: `terminal list` to tell apart workspaces that share a name and branch,
   `terminal switch` to show the terminals it opens, and `file open --line` for stack traces.
-- **Local only.** Docker runs on this machine, so workspaces on SSH hosts are not listed.
+- **Local workspaces.** Workspaces on SSH hosts are not listed. Docker uses the worker's effective
+  context or `DOCKER_HOST`, which can point to a remote daemon. New terminals are pinned to that
+  same target. Remote containers need bind-mount/source paths meaningful on the daemon host.
 - **Safety.** The worker acts only in folders Orca lists as local workspaces, checks every
-  service name, container id and time it receives, never runs a shell for its own commands, and
-  quotes what it types into terminals. Log text is rendered as text.
+  service name, container id and time it receives, verifies container project labels and working
+  directory before operations, never runs a shell for its own commands, and quotes what it types
+  into terminals. Compose actions are refused if another workspace uses the same project name;
+  assign a unique `name:` or `COMPOSE_PROJECT_NAME` to those stacks. Custom Compose paths must
+  resolve to files inside the workspace, including through symlinks. Log text is rendered as text.
 
 ## Layout
 
@@ -73,12 +112,20 @@ asks you to approve full access.
 | `src/worker.ts`      | Worker: panel requests, terminals, agent, status bar and notifications     |
 | `src/docker.ts`      | Finds and runs docker; parses `compose config`, `inspect`, `stats`, logs   |
 | `src/status.ts`      | Status bar summary and which container problems notify                     |
+| `src/compose.ts`     | Compose command arguments and validation of workspace configuration        |
+| `src/diagnostics.ts` | Container diagnostics shared by the panel and agent hand-off               |
+| `src/async.ts`       | Shared Docker process concurrency budget                                   |
 | `src/sources.ts`     | Which project file a stack trace path in a container is                    |
 | `src/orca-cli.ts`    | The `orca` CLI calls: terminal lookup and switch, opening a file at a line |
 | `src/workspaces.ts`  | Local workspaces with compose files; which one is focused                  |
 | `src/protocol.ts`    | Request and answer types shared by the panel and the worker                |
 | `panel/index.html`   | Panel markup and styles (Orca theme variables)                             |
 | `panel/main.ts`      | Panel logic: project, containers, actions, logs                            |
+| `panel/requests.ts`  | Request ownership and cancellation across navigation and Clear             |
+| `panel/log-buffer.ts`| Incremental log history, overlap deduplication and retention                |
+| `panel/log-model.ts` | Structured fields, filtering, grouping and incident context                |
+| `panel/log-view.ts`  | DOM reconciliation that preserves existing log lines                       |
+| `panel/ports.ts`     | Port addresses and recognized HTTP/HTTPS links                              |
 | `panel/levels.ts`    | Error and warning detection, level words to colour                         |
 | `panel/links.ts`     | Web addresses and stack trace locations in log lines                       |
 | `panel/sparkline.ts` | `docker stats` numbers and chart points                                    |
@@ -87,11 +134,29 @@ asks you to approve full access.
 
 ## Develop
 
+Use Node 24.15+ (or Node 26+) for development; the plugin itself keeps no runtime npm dependencies.
+
 ```sh
-orca plugin validate . --json
-orca plugin test . --json          # parsers, levels, links, sources, worker over a fake docker and CLI
-orca plugin dev watch . --json     # load into Orca (asks for approval), stream logs and reloads
+npm ci
+npm run check                     # source/manifest integrity, strict TypeScript and tests
+orca plugin validate . --json     # official Orca manifest validation
+orca plugin test . --json         # same tests, using Orca's actual worker host testing kit
+orca plugin dev watch . --json    # load into Orca, stream logs and reloads
 ```
 
-`.orca/types` cannot be generated by Orca 1.4.249 (its bundle lacks `orca.d.ts`), so `npx tsc -p .`
-has no Orca typings yet; the panel declares the few `orca` calls it uses itself.
+CI runs the portable checks on Linux and macOS. Worker tests use a fake Docker and Orca CLI;
+DOM tests run the bundled panel in jsdom and exercise navigation races, Clear, selection,
+incremental updates, diagnostics, settings and structured logs. No test changes real containers
+or starts an agent in these portable/Orca suites. `npm test` maps `orca/testing` to `test/host.ts`, a small stand-in; the Orca
+command uses its own kit and checks the actual host API contract as well.
+
+For an opt-in live integration check, run `npm run test:docker`. It uses a cached standard Linux
+shell image (or `DOCKER_LOGS_TEST_IMAGE`), creates a uniquely named temporary Compose stack and a
+foreign-container fixture, and removes those fixtures in `finally`. It never pulls an image.
+This checks nested `COMPOSE_FILE`, project ownership, profiles, logs, stats, Clear, cursors,
+bind-mount source mapping and restart against a real daemon. It requires Docker socket access.
+
+`tsconfig.json` is self-contained. `types/worker.ts` describes the worker API surface used here,
+so type checking works even with Orca builds whose `plugin types` command cannot generate
+`orca.d.ts`. It does not replace the official runtime/manifest checks above. Development loading
+requires Orca's approval for the trusted worker.

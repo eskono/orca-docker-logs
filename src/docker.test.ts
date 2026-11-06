@@ -60,11 +60,17 @@ test('reads containers from docker inspect', () => {
     service: 'app',
     state: 'running',
     exitCode: 0,
+    oomKilled: false,
+    restartCount: 0,
+    stateError: '',
+    project: 'proj',
+    workingDir: '',
     health: 'unhealthy',
     healthLog: 'curl: (7) refused',
     startedAt: '2026-11-05T09:00:00.123456789Z',
     finishedAt: null,
-    ports: [3001, 8000]
+    ports: [3001, 8000],
+    portBindings: [{ port: 3001, containerPort: 3000, host: '127.0.0.1' }, { port: 8000, containerPort: 8000, host: '0.0.0.0' }, { port: 8000, containerPort: 8000, host: '::' }]
   })
 })
 

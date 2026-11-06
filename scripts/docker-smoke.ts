@@ -1,0 +1,91 @@
+// Opt-in integration check: only disposable, uniquely named containers; never pulls an image.
+import assert from 'node:assert/strict'
+import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { findDocker, run } from '../src/docker'
+import { timeKey } from '../src/log-time'
+import { hasComposeFile } from '../src/workspaces'
+import { mockHost, mountWorker } from '../test/host'
+import * as main from '../src/worker'
+import type { LogLine, ServiceRow } from '../src/protocol'
+
+const bin = await findDocker('')
+const docker = (args: string[], cwd?: string) => run(bin, args, { cwd, timeoutMs: 45_000 })
+await docker(['info', '--format', '{{.ServerVersion}}'])
+const installed = (await docker(['image', 'ls', '--filter', 'dangling=false', '--format', '{{json .}}'])).stdout.trim().split('\n').filter(Boolean).map((value) => JSON.parse(value) as { Repository: string; Tag: string })
+const requested = process.env.DOCKER_LOGS_TEST_IMAGE
+const cached = installed.find((image) => /(?:^|\/)(alpine|busybox|python|node|debian|ubuntu|postgres|redis|nginx)$/.test(image.Repository) && image.Tag !== '<none>')
+const image = requested || (cached ? `${cached.Repository}:${cached.Tag}` : null)
+if (!image || image.startsWith('-') || !/^[\w./:@-]+$/.test(image)) throw new Error('No cached shell image found. Set DOCKER_LOGS_TEST_IMAGE to a cached Linux image with sh and sleep; this check never pulls images.')
+await docker(['image', 'inspect', image])
+const root = await realpath(await mkdtemp(join(tmpdir(), 'docker-logs-smoke-')))
+const project = `orca-logs-smoke-${Date.now()}-${process.pid}`
+let foreignId: string | null = null
+let worker: Awaited<ReturnType<typeof mountWorker>> | null = null
+try {
+  await mkdir(join(root, 'infra'))
+  await mkdir(join(root, 'code'))
+  await writeFile(join(root, 'code', 'main.py'), 'print("smoke fixture")\n')
+  await writeFile(join(root, '.env'), `COMPOSE_FILE=infra/stack.yml\nCOMPOSE_PROJECT_NAME=${project}\n`)
+  const service = {
+    image, entrypoint: ['/bin/sh', '-c'], command: ['i=0; while [ "$$i" -lt 120 ]; do echo "INFO tick $$i"; echo "ERROR fixture $$i" >&2; i=$$((i + 1)); sleep 1; done'],
+    network_mode: 'none', read_only: true, cap_drop: ['ALL']
+  }
+  // JSON is a Compose-supported YAML subset. A nested file exercises project working_dir labels.
+  await writeFile(join(root, 'infra', 'stack.yml'), JSON.stringify({ services: {
+    app: { ...service, volumes: ['../code:/app:ro'] },
+    db: service,
+    tools: { ...service, profiles: ['tools'] }
+  } }))
+  assert.equal(await hasComposeFile(root), true)
+  await docker(['compose', 'up', '-d', '--pull', 'never'], root)
+  const host = mockHost({ settings: { dockerPath: bin }, results: {
+    'workspace.list': { workspaces: [{ id: 'smoke', name: 'smoke', path: root, branch: 'main', hostId: 'local' }] }
+  } })
+  worker = await mountWorker(main, { host })
+  const model = await worker.request('services.list', { path: root })
+  const app = model.rows.find((row: ServiceRow) => row.service === 'app') as ServiceRow
+  const db = model.rows.find((row: ServiceRow) => row.service === 'db') as ServiceRow
+  assert.equal(app.state, 'running')
+  assert.equal(db.state, 'running')
+  assert.equal(model.rows.find((row: ServiceRow) => row.service === 'tools').containerId, null)
+  assert.equal(model.project, project)
+  assert.notEqual(model.context.name, 'unknown')
+  const targets = [app, db].map((row) => ({ service: row.service, name: row.name, containerId: row.containerId! }))
+  const first = await worker.request('logs.get', { path: root, targets })
+  assert.equal(first.errors.length, 0)
+  assert.ok(first.lines.some((line: LogLine) => line.m.startsWith('ERROR fixture')))
+  assert.ok(first.lines.some((line: LogLine) => line.e))
+  const mapped = await worker.request('code.resolve', { path: root, service: 'app', files: ['/app/main.py'] })
+  assert.equal(mapped.files['/app/main.py'], 'code/main.py')
+  const stats = await worker.request('stats.get', { path: root, containerIds: [app.containerId, db.containerId] })
+  assert.ok(stats.stats[app.containerId!])
+  await worker.request('compose.set', { path: root, options: { files: ['infra/stack.yml'], profiles: ['tools'] } })
+  await worker.request('service.action', { path: root, service: app.service, containerId: app.containerId, action: 'restart' })
+  const { clearedAt } = await worker.request('logs.clear', { path: root, services: ['app', 'db'] })
+  await new Promise((done) => setTimeout(done, 1200))
+  const cleared = await worker.request('logs.get', { path: root, targets })
+  assert.equal(cleared.errors.length, 0)
+  assert.ok(cleared.lines.length > 0)
+  assert.ok(cleared.lines.every((line: LogLine) => timeKey(line.t) >= timeKey(clearedAt)))
+  const cursor = cleared.lines.filter((line: LogLine) => line.containerId === app.containerId).at(-1).t
+  const increment = await worker.request('logs.get', { path: root, targets: [{ ...targets[0], cursor }] })
+  assert.ok(increment.lines.every((line: LogLine) => timeKey(line.t) >= timeKey(cursor)))
+  await worker.request('logs.clear', { path: root, services: ['app', 'db'], reset: true })
+  foreignId = (await docker(['run', '-d', '--pull', 'never', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--name', `${project}-foreign`, '--entrypoint', '/bin/sh', image, '-c', 'sleep 120'])).stdout.trim()
+  await assert.rejects(worker.request('service.action', { path: root, service: 'app', containerId: foreignId, action: 'stop' }), { code: 'not_permitted' })
+  assert.equal((await docker(['inspect', '--format', '{{.State.Running}}', foreignId])).stdout.trim(), 'true')
+  console.log('Live Docker smoke passed: nested COMPOSE_FILE, ownership, profiles, stdout/stderr logs, Clear, cursors, stats, bind-mount source mapping and restart.')
+} catch (error) {
+  const logs = await docker(['compose', '-p', project, '-f', 'infra/stack.yml', 'logs', '--no-color', '--tail', '10'], root).catch(() => null)
+  if (logs) console.error(logs.stdout + logs.stderr)
+  throw error
+} finally {
+  await worker?.deactivate()
+  let cleanupFailed = false
+  if (foreignId) await docker(['rm', '-f', foreignId]).catch((error) => { cleanupFailed = true; console.error(error) })
+  await docker(['compose', '-p', project, '-f', 'infra/stack.yml', '--profile', '*', 'down', '--remove-orphans'], root).catch((error) => { cleanupFailed = true; console.error(error) })
+  if (!cleanupFailed) await rm(root, { recursive: true, force: true })
+  else { console.error(`Cleanup needs attention: project ${project}, files ${root}`); process.exitCode = 1 }
+}

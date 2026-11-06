@@ -10,6 +10,10 @@ function row(fields: Partial<ServiceRow>): ServiceRow {
     name: 'proj-x-1',
     state: 'running',
     exitCode: 0,
+    oomKilled: false,
+    restartCount: 0,
+    stateError: '',
+    portBindings: [],
     health: '',
     healthLog: '',
     startedAt: null,
@@ -59,4 +63,14 @@ test('notifies once when a problem appears, not for what was already wrong', () 
   assert.equal(tracker.update([crashed], 6000 + NOTIFY_COOLDOWN_MS).length, 1)
   tracker.reset()
   assert.deepEqual(tracker.update([row({ containerId: 'c', state: 'dead' })], 0), [])
+})
+
+test('OOM and SIGKILL are visible failures and restart-count increases notify between polls', () => {
+  assert.match(problemOf(row({ state: 'exited', exitCode: 137, oomKilled: true }))!, /out of memory/)
+  assert.equal(problemOf(row({ state: 'exited', exitCode: 137 })), 'exited with code 137')
+  const tracker = new ProblemTracker()
+  tracker.update([row({ containerId: 'a', restartCount: 1 })], 0)
+  const fresh = tracker.update([row({ containerId: 'a', restartCount: 2 })], 1000)
+  assert.equal(fresh[0].problem, 'restarted unexpectedly')
+  assert.equal(tracker.update([row({ containerId: 'a', restartCount: 2 })], 2000).length, 0)
 })

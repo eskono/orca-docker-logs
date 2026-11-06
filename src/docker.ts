@@ -5,6 +5,10 @@ import { access } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join } from 'node:path'
 import type { ContainerStats, LogLine, ServiceRow } from './protocol'
+import { createLimiter } from './async'
+import { timeKey } from './log-time'
+
+const limited = createLimiter(4)
 
 /** An Error carrying a `code`, which Orca hands to the panel's `plugin.request` rejection. */
 export function fail(code: string, message: string): Error {
@@ -64,19 +68,19 @@ function childEnv(binary: string): NodeJS.ProcessEnv {
   return { ...process.env, PATH: [...new Set(dirs)].join(delimiter) }
 }
 
-export type RunOptions = { cwd?: string; timeoutMs: number }
+export type RunOptions = { cwd?: string; timeoutMs: number; signal?: AbortSignal }
 
 /** Runs a binary without a shell; rejects with `code: 'action_failed'` and its stderr. */
 export function run(
   binary: string,
   args: string[],
-  { cwd, timeoutMs }: RunOptions
+  { cwd, timeoutMs, signal }: RunOptions
 ): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
+  return limited(() => new Promise((resolve, reject) => {
     execFile(
       binary,
       args,
-      { cwd, env: childEnv(binary), timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' },
+      { cwd, env: childEnv(binary), timeout: timeoutMs, signal, maxBuffer: 8 * 1024 * 1024, encoding: 'utf8' },
       (error, stdout, stderr) => {
         if (!error) return resolve({ stdout, stderr })
         const err = error as NodeJS.ErrnoException & { killed?: boolean }
@@ -85,7 +89,7 @@ export function run(
         reject(fail('action_failed', stderr.trim() || err.message))
       }
     )
-  })
+  }), signal)
 }
 
 /** Non-empty trimmed lines, as `config --profiles` and `ps -q` print them. */
@@ -124,25 +128,34 @@ export type Container = {
   service: string
   state: string
   exitCode: number | null
+  oomKilled: boolean
+  restartCount: number
+  stateError: string
+  project: string
+  workingDir: string
   health: string
   healthLog: string
   startedAt: string | null
   finishedAt: string | null
   ports: number[]
+  portBindings: ServiceRow['portBindings']
 }
 
 type InspectEntry = {
   Id?: unknown
   Name?: unknown
+  RestartCount?: unknown
   State?: {
     Status?: unknown
     ExitCode?: unknown
+    OOMKilled?: unknown
+    Error?: unknown
     StartedAt?: unknown
     FinishedAt?: unknown
     Health?: { Status?: unknown; Log?: { Output?: unknown }[] }
   }
   Config?: { Labels?: Record<string, unknown> }
-  NetworkSettings?: { Ports?: Record<string, { HostPort?: unknown }[] | null> }
+  NetworkSettings?: { Ports?: Record<string, { HostPort?: unknown; HostIp?: unknown }[] | null> }
 }
 
 /** Docker's "never" timestamp (`0001-01-01T00:00:00Z`) and missing values become null. */
@@ -151,16 +164,18 @@ function time(value: unknown): string | null {
 }
 
 /** Published TCP host ports, once each (Docker lists IPv4 and IPv6 bindings separately). */
-function publishedPorts(ports: Record<string, { HostPort?: unknown }[] | null> | undefined): number[] {
-  const found = new Set<number>()
-  for (const [key, bindings] of Object.entries(ports ?? {})) {
+function publishedPorts(ports: InspectEntry['NetworkSettings']): ServiceRow['portBindings'] {
+  const found = new Map<string, ServiceRow['portBindings'][number]>()
+  for (const [key, bindings] of Object.entries(ports?.Ports ?? {})) {
     if (!key.endsWith('/tcp')) continue
     for (const binding of bindings ?? []) {
       const port = Number(binding.HostPort)
-      if (Number.isInteger(port) && port > 0) found.add(port)
+      const containerPort = Number(key.split('/')[0])
+      const host = typeof binding.HostIp === 'string' ? binding.HostIp : ''
+      if (Number.isInteger(port) && port > 0 && port <= 65535) found.set(`${host}:${port}`, { port, containerPort, host })
     }
   }
-  return [...found].sort((a, b) => a - b)
+  return [...found.values()].sort((a, b) => a.port - b.port)
 }
 
 export function parseInspect(stdout: string): Container[] {
@@ -172,6 +187,8 @@ export function parseInspect(stdout: string): Container[] {
     // Docker keeps the last health status after a container stops; it only means something while it runs.
     const health = state.Status === 'running' && typeof state.Health?.Status === 'string' ? state.Health.Status : ''
     const lastCheck = state.Health?.Log?.at(-1)?.Output
+    const labels = entry.Config?.Labels ?? {}
+    const portBindings = publishedPorts(entry.NetworkSettings)
     return [
       {
         id: entry.Id,
@@ -179,11 +196,17 @@ export function parseInspect(stdout: string): Container[] {
         service,
         state: typeof state.Status === 'string' ? state.Status : 'unknown',
         exitCode: typeof state.ExitCode === 'number' ? state.ExitCode : null,
+        oomKilled: state.OOMKilled === true,
+        restartCount: typeof entry.RestartCount === 'number' ? entry.RestartCount : 0,
+        stateError: typeof state.Error === 'string' ? state.Error.slice(0, 2000) : '',
+        project: typeof labels['com.docker.compose.project'] === 'string' ? labels['com.docker.compose.project'] as string : '',
+        workingDir: typeof labels['com.docker.compose.project.working_dir'] === 'string' ? labels['com.docker.compose.project.working_dir'] as string : '',
         health,
         healthLog: health && health !== 'healthy' && typeof lastCheck === 'string' ? lastCheck.trim().slice(0, 1000) : '',
         startedAt: time(state.StartedAt),
         finishedAt: time(state.FinishedAt),
-        ports: publishedPorts(entry.NetworkSettings?.Ports)
+        ports: [...new Set(portBindings.map((p) => p.port))],
+        portBindings
       }
     ]
   })
@@ -208,11 +231,15 @@ export function buildRows(config: ComposeConfig, containers: Container[]): Servi
           name: service,
           state: 'not created',
           exitCode: null,
+          oomKilled: false,
+          restartCount: 0,
+          stateError: '',
           health: '',
           healthLog: '',
           startedAt: null,
           finishedAt: null,
           ports: [],
+          portBindings: [],
           profiles,
           build
         }
@@ -225,11 +252,15 @@ export function buildRows(config: ComposeConfig, containers: Container[]): Servi
       name: c.name,
       state: c.state,
       exitCode: c.exitCode,
+      oomKilled: c.oomKilled,
+      restartCount: c.restartCount,
+      stateError: c.stateError,
       health: c.health,
       healthLog: c.healthLog,
       startedAt: c.startedAt,
       finishedAt: c.finishedAt,
       ports: c.ports,
+      portBindings: c.portBindings,
       profiles,
       build
     }))
@@ -273,7 +304,7 @@ export function containerLines(stdout: string, stderr: string, src?: string): Lo
  * stable string sort interleaves them correctly.
  */
 export function byTime(lines: LogLine[]): LogLine[] {
-  return [...lines].sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0))
+  return [...lines].sort((a, b) => timeKey(a.t).localeCompare(timeKey(b.t)))
 }
 
 const jsonBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value)) + 1
