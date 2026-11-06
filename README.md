@@ -4,7 +4,7 @@ An Orca sidebar panel for the Docker Compose containers of the focused project: 
 memory over time, ports, start / stop / restart / rebuild, a shell, and a live log with error
 highlighting whose stack traces open the code, and that you can hand to your agent in one click.
 
-**Install:** [onorca.dev/plugins/eskono.docker-logs](https://onorca.dev/plugins/eskono.docker-logs?catalog=community).
+**Catalog listing:** [Docker Logs on Orca](https://www.onorca.dev/plugins/eskono/orca-docker-logs).
 It runs its own worker (it calls the `docker` CLI, opens terminals and starts agents), so Orca
 asks you to approve full access.
 
