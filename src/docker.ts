@@ -1,5 +1,5 @@
 // Running the docker CLI and parsing what it prints. No Orca API here, so tests can use it directly.
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { constants } from 'node:fs'
 import { access } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -69,6 +69,11 @@ function childEnv(binary: string): NodeJS.ProcessEnv {
 }
 
 export type RunOptions = { cwd?: string; timeoutMs: number; signal?: AbortSignal }
+
+/** Long-lived event subscriptions have a separate, explicitly bounded lifecycle. */
+export function spawnDocker(binary: string, args: string[]) {
+  return spawn(binary, args, { env: childEnv(binary), stdio: ['ignore', 'pipe', 'pipe'] })
+}
 
 /** Runs a binary without a shell; rejects with `code: 'action_failed'` and its stderr. */
 export function run(

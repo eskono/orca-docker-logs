@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "docker-logs",
   "name": "Docker Logs",
-  "version": "0.4.0",
-  "description": "Your Docker Compose containers in Orca: live logs with errors highlighted, stack traces that open the code, CPU and memory history, ports, start/stop/rebuild, a shell, and Ask agent.",
+  "version": "0.5.0",
+  "description": "Docker Compose in Orca: combined live logs, saved views, context-preserving search, collapsible stack traces, operation progress, container events, diagnostics and Ask agent.",
   "author": {
     "name": "Maksim Shevchuk"
   },
@@ -99,6 +99,9 @@
     },
     {
       "kind": "terminal:send"
+    },
+    {
+      "kind": "terminal:read"
     },
     {
       "kind": "agent:launch"

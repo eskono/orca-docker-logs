@@ -11,6 +11,7 @@ const WARN_WORDS = /\b(WARN|WARNING)\b/
 const WARN_FIELDS = /\blevel=warn(ing)?\b|"(level|severity|lvl)"\s*:\s*"warn(ing)?"|"level"\s*:\s*40\b|\[warn(ing)?\]/i
 
 export function levelOf(text: string): Level {
+  if (/^(?:Error:|panic:)/.test(text)) return 'error'
   if (ERROR_WORDS.test(text) || ERROR_FIELDS.test(text)) return 'error'
   if (WARN_WORDS.test(text) || WARN_FIELDS.test(text)) return 'warn'
   return null
@@ -23,7 +24,7 @@ export function levels(texts: string[], sources: string[] = []): Level[] {
     const source = sources[i] ?? ''
     const own = levelOf(text)
     if (own) { carried.set(source, own); return own }
-    if (carried.get(source) && /^\s+\S/.test(text)) return carried.get(source) ?? null
+    if (carried.get(source) && (/^\s+\S/.test(text) || /^goroutine \d+ \[|^[\w./*]+\([^\n]*\)$|^\/[^\s]+\.[a-z]+:\d+/.test(text))) return carried.get(source) ?? null
     carried.delete(source)
     return null
   })

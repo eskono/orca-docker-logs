@@ -32,7 +32,7 @@
         background: var(--orca-background);
       }
       button, select, input { font: inherit; color: inherit; }
-      button, select, input[type='search'] {
+      button, select, input[type='search'], #view-name {
         border: 1px solid var(--orca-input, var(--orca-border));
         border-radius: var(--radius);
         background: var(--orca-background);
@@ -102,6 +102,19 @@
       .json-fields dt { opacity: .7; overflow-wrap: anywhere; }
       .json-fields dd { margin: 0; overflow-wrap: anywhere; }
       .log-warning { color: var(--warn); }
+      mark.search-hit { background: #e3b34155; color: inherit; border-radius: 2px; }
+      mark.current-match { background: #e3b341; color: #181818; outline: 1px solid currentColor; }
+      .current-error { outline: 1px solid var(--bad); outline-offset: -1px; }
+      .search-count { flex: none; min-width: 35px; font-variant-numeric: tabular-nums; }
+      .activity { margin: 0 8px; flex: 0 1 auto; min-height: 24px; max-height: 180px; overflow: auto; }
+      .activity > summary { cursor: pointer; padding: 3px 0; }
+      .operation { padding: 5px 0; border-bottom: 1px solid var(--orca-border); }
+      .operation-status { margin-left: auto; font-size: 11px; }
+      .operation-running .operation-status { color: var(--warn); }
+      .operation-failed .operation-status { color: var(--bad); }
+      .operation-succeeded .operation-status { color: var(--ok); }
+      .operation pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.4 var(--mono); }
+      .operation summary { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--orca-muted-foreground); cursor: pointer; }
       .service { display: flex; align-items: center; gap: 6px; padding-right: 4px; border-radius: var(--radius); }
       .service.selected { background: var(--orca-accent); color: var(--orca-accent-foreground); }
       .service:not(.selected):hover { background: var(--orca-muted); }
@@ -195,6 +208,15 @@
       .level-word.warn { color: var(--ansi-3); }
       .level-word.error { color: var(--ansi-1); }
       .src { font-weight: 600; }
+      .trace { display: block; margin-left: 12px; }
+      .trace summary { color: var(--orca-muted-foreground); cursor: pointer; white-space: normal; }
+      .trace-project { background: color-mix(in srgb, var(--orca-primary) 12%, transparent); }
+      .trace-library { opacity: .65; }
+      .service-select { margin-left: 6px; flex: 0 0 auto; }
+      #events-list { max-height: 160px; overflow: auto; }
+      .event { display: flex; gap: 6px; align-items: baseline; margin: 4px 0; }
+      .event .link { text-align: left; white-space: normal; }
+      #view-name { min-width: 50px; flex: 1; }
       .placeholder { padding: 4px 8px; color: var(--orca-muted-foreground); font-family: system-ui, sans-serif; white-space: normal; }
       .b { font-weight: 700; } .d { opacity: 0.7; } .i { font-style: italic; } .u { text-decoration: underline; }
       .f0 { color: var(--ansi-0); } .f1 { color: var(--ansi-1); } .f2 { color: var(--ansi-2); } .f3 { color: var(--ansi-3); }
@@ -234,6 +256,14 @@
       </details>
     </header>
     <div id="notice" class="notice" role="status" hidden></div>
+    <details id="operations" class="activity" hidden>
+      <summary><span id="operations-title">Recent operations</span></summary>
+      <div id="operations-list"></div>
+    </details>
+    <details id="events" class="activity">
+      <summary><span id="events-title">Container events</span></summary>
+      <div id="events-list"></div>
+    </details>
     <ul id="services" class="services" aria-label="Containers"></ul>
     <div id="services-resize" class="services-resize" tabindex="0" role="separator" aria-label="Resize service list" aria-orientation="horizontal" aria-valuemin="48" aria-valuemax="600" aria-valuenow="160"></div>
     <details id="diagnostics" class="diagnostics" hidden>
@@ -241,6 +271,12 @@
       <div id="diagnostic-body"></div>
     </details>
     <div class="logbar">
+      <div class="row">
+        <select id="saved-view" aria-label="Saved view"><option value="">Saved views…</option></select>
+        <input id="view-name" placeholder="View name" aria-label="View name" maxlength="60" />
+        <button id="view-save" disabled>Save view</button>
+        <button id="view-delete" disabled>Delete</button>
+      </div>
       <div class="row">
         <strong id="log-title" class="log-title">Logs</strong>
         <button id="ask" title="Start an agent with the lines shown and ask it to find the cause" disabled>Ask agent</button>
@@ -261,7 +297,17 @@
           <option value="15m">Last 15 minutes</option>
           <option value="1h">Last hour</option>
           <option value="start">Since start</option>
+          <option value="event" disabled>Around event (±30s)</option>
         </select>
+        <button id="live" hidden>Live logs</button>
+      </div>
+      <div class="row">
+        <input id="search" type="search" placeholder="Find in loaded logs" aria-label="Find in log" maxlength="512" />
+        <span id="search-count" class="search-count" aria-live="polite"></span>
+        <button id="search-previous" title="Previous match (Shift+Enter)" aria-label="Previous match" disabled>↑</button>
+        <button id="search-next" title="Next match (Enter)" aria-label="Next match" disabled>↓</button>
+        <button id="error-previous" title="Previous error (Alt+Up)" aria-label="Previous error" disabled>↑ Error</button>
+        <button id="error-next" title="Next error (Alt+Down)" aria-label="Next error" disabled>↓ Error</button>
       </div>
       <div class="row">
         <label><input id="follow" type="checkbox" checked /> Follow</label>

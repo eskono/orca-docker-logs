@@ -6,11 +6,14 @@ import type { OrcaWorkerApi } from 'orca/worker'
 import { buildRows, byTime, containerLines, fail, findDocker, lines, newestWithin, parseConfig, parseInspect, parseStats, run, shellQuote, type Container, type ComposeConfig } from './docker'
 import { composeArgs, composeEnvFile, defaultOptions, validateOptions } from './compose'
 import { diagnosticSummary } from './diagnostics'
-import { latestTime } from './log-time'
+import { latestTime, timeKey } from './log-time'
 import type { ComposeOptions, DockerContext, FocusContext, LogAnswer, LogLine, ProjectAction, Requests, ServiceAction, ServiceRow, Workspace } from './protocol'
 import { openFile, revealTerminal } from './orca-cli'
 import { resolveSource } from './sources'
 import { ProblemTracker, summarize } from './status'
+import { Operations } from './operations'
+import { Events } from './events'
+import { validateViews } from './views'
 import { hasComposeFile, localOnly, resolveFocused, type ListedWorkspace } from './workspaces'
 
 const TAIL_LINES = 1000
@@ -26,13 +29,14 @@ const TRACE_PATH = /^\/(?!.*(?:^|\/)\.\.(?:\/|$))[^\0-\x1f]{1,1023}$/
 const AGENT_MAX_LINES = 300
 const AGENT_MAX_CHARS = 24_000
 let statusTimer: ReturnType<typeof setInterval> | null = null
-let stopWorker: (() => void) | null = null
+let stopWorker: (() => void | Promise<void>) | null = null
 
-export function deactivate(): void {
+export async function deactivate(): Promise<void> {
   if (statusTimer) clearInterval(statusTimer)
   statusTimer = null
-  stopWorker?.()
+  const stop = stopWorker
   stopWorker = null
+  await stop?.()
 }
 
 type Handler<K extends keyof Requests> = (input: Requests[K]['input'], signal?: AbortSignal) => Promise<Requests[K]['output']>
@@ -82,9 +86,11 @@ function agentTail(logLines: string[]): string[] {
 }
 
 export default function activate(orca: OrcaWorkerApi): void {
-  deactivate()
+  void deactivate()
   let stopped = false
-  stopWorker = () => { stopped = true }
+  const operations = new Operations(orca.storage, async (terminalId) => await orca.host.call('terminal.read', { terminalId, maxLines: 200 }) as { lines: string[]; truncated: boolean })
+  const events = new Events(orca.storage, undefined, async (path, parsed) => belongsTo(path, { project: parsed.project, workingDir: parsed.workingDir }, parsed.project))
+  stopWorker = async () => { stopped = true; await Promise.all([operations.dispose(), events.dispose()]) }
   let cachedWorkspaces: { at: number; list: Workspace[] } | null = null
   type ConfigEntry = { at: number; config: ComposeConfig; profiles: string[]; options: ComposeOptions; envFile?: string }
   const configCache = new Map<string, ConfigEntry>()
@@ -132,7 +138,12 @@ export default function activate(orca: OrcaWorkerApi): void {
       return { name: host ? 'DOCKER_HOST' : 'unknown', endpoint: host, remote: !!host && !/^(unix|npipe):/.test(host) }
     }
   }
-  async function belongsTo(path: string, container: Container, project: string): Promise<boolean> {
+  async function watchEvents(path: string, bin: string, model: { project: string }) {
+    const context = await dockerContext(bin)
+    const prefix = !process.env.DOCKER_CONTEXT && process.env.DOCKER_HOST ? ['--host', process.env.DOCKER_HOST] : context.name !== 'unknown' ? ['--context', context.name] : []
+    return events.watch({ path, binary: bin, project: model.project, context: `${context.name}\0${context.endpoint}`, prefix })
+  }
+  async function belongsTo(path: string, container: Pick<Container, 'project' | 'workingDir'>, project: string): Promise<boolean> {
     if (container.project !== project || !container.workingDir) return false
     const root = await realpath(path)
     const actual = await realpath(container.workingDir).catch(() => resolve(container.workingDir))
@@ -170,16 +181,20 @@ export default function activate(orca: OrcaWorkerApi): void {
     const problem = await revealTerminal(terminalId)
     if (problem) orca.log(`could not switch to terminal ${terminalId}: ${problem}`)
   }
-  async function openTerminal(path: string, title: string, args: string[], bin: string): Promise<string> {
+  async function openTerminal(path: string, title: string, args: string[], bin: string, tracked?: { service: string | null }): Promise<string> {
     const workspace = await workspaceFor(path)
     const context = await dockerContext(bin)
     // The terminal may have a different environment from the worker: pin the Docker target it showed.
     const target = !process.env.DOCKER_CONTEXT && process.env.DOCKER_HOST ? ['--host', process.env.DOCKER_HOST] : context.name !== 'unknown' ? ['--context', context.name] : []
     const command = `cd ${shellQuote(path)} && ${[bin, ...target, ...args].map(shellQuote).join(' ')}`
-    const { terminalId } = await orca.host.call('terminal.create', { workspaceId: workspace.id, title, command }) as { terminalId: string }
-    await reveal(terminalId)
-    return terminalId
+    const create = async (command: string) => {
+      const { terminalId } = await orca.host.call('terminal.create', { workspaceId: workspace.id, title, command }) as { terminalId: string }
+      await reveal(terminalId)
+      return terminalId
+    }
+    return tracked ? operations.terminal(path, title, tracked.service, command, create) : create(command)
   }
+
   async function clearedMark(path: string, service: string): Promise<string | null> {
     // Keep the original key, so existing Clear marks survive the upgrade.
     const saved = await orca.storage.get(keyFor('cleared', path, service))
@@ -210,6 +225,33 @@ export default function activate(orca: OrcaWorkerApi): void {
       const { project, rows, options, profiles } = await readProject(path, bin, input.fresh === true, signal)
       return { project, rows, options, profiles, context: await dockerContext(bin, signal) }
     },
+    'views.get': async (input) => {
+      const { path } = await workspaceFor(input.path)
+      const saved = await orca.storage.get(keyFor('views', path))
+      try { return { views: validateViews(saved ?? []) } }
+      catch { return { views: [] } }
+    },
+    'views.set': async (input) => {
+      const { path } = await workspaceFor(input.path)
+      let views
+      try { views = validateViews(input.views) }
+      catch (error) { throw invalid(error instanceof Error ? error.message : 'Invalid saved views') }
+      await orca.storage.set(keyFor('views', path), views)
+      return { views }
+    },
+    'events.list': async (input, signal) => {
+      const { path } = await workspaceFor(input.path)
+      const bin = await docker()
+      const model = await composeConfig(path, bin, false, undefined, signal)
+      return watchEvents(path, bin, { project: model.config.name })
+    },
+    'operations.list': async (input) => ({ operations: await operations.list((await workspaceFor(input.path)).path) }),
+    'operations.open': async (input) => {
+      const { path } = await workspaceFor(input.path)
+      if (typeof input.id !== 'string') throw invalid('Invalid operation id')
+      await reveal(await operations.terminalFor(path, input.id))
+      return { opened: true }
+    },
     'stats.get': async (input, signal) => {
       const { path } = await workspaceFor(input.path)
       const ids = checkedIds(input.containerIds)
@@ -226,8 +268,9 @@ export default function activate(orca: OrcaWorkerApi): void {
       if (!raw.length || raw.length > MAX_CONTAINERS) throw invalid('Invalid containers')
       const targets = raw.map((t) => {
         if (!t || typeof t !== 'object') throw invalid('Invalid log target')
-        return { service: checkName(t.service, 'service name'), id: checkContainer(t.containerId), name: checkName(t.name, 'container name'), since: checkTime(t.since), cursor: checkTime(t.cursor) }
+        return { service: checkName(t.service, 'service name'), id: checkContainer(t.containerId), name: checkName(t.name, 'container name'), since: checkTime(t.since), until: checkTime(t.until), cursor: checkTime(t.cursor) }
       })
+      if (targets.some((t) => t.since && t.until && timeKey(t.since) > timeKey(t.until))) throw invalid('Log period ends before it starts')
       const services = [...new Set(targets.map((t) => t.service))]
       const marks = new Map(await Promise.all(services.map(async (s) => [s, await clearedMark(path, s)] as const)))
       const bin = await docker()
@@ -239,9 +282,10 @@ export default function activate(orca: OrcaWorkerApi): void {
         try {
           const row = ownedRow(rows, target.id, target.service)
           const since = latestTime(marks.get(target.service), target.since, target.cursor)
+          if (since && target.until && timeKey(since) > timeKey(target.until)) return []
           const cap = target.since || target.cursor ? WINDOW_LINES : several ? Math.max(200, Math.ceil(TAIL_LINES / targets.length)) : TAIL_LINES
           // One extra line proves a cap was reached rather than guessing from the answer size.
-          const result = await run(bin, ['logs', '--timestamps', '--tail', String(cap + 1), ...(since ? ['--since', since] : []), row.containerId as string], { timeoutMs: 20_000, signal })
+          const result = await run(bin, ['logs', '--timestamps', '--tail', String(cap + 1), ...(since ? ['--since', since] : []), ...(target.until ? ['--until', target.until] : []), row.containerId as string], { timeoutMs: 20_000, signal })
           let log: LogLine[] = containerLines(result.stdout, result.stderr, several ? row.name : undefined).map((line) => ({ ...line, containerId: row.containerId as string }))
           if (log.length > cap) { log = byTime(log).slice(-cap); tailLimited = true }
           return log
@@ -278,10 +322,10 @@ export default function activate(orca: OrcaWorkerApi): void {
         const declared = model.config.services[service]
         if (!declared) throw invalid('Unknown Compose service')
         const args = [...composeArgs(model.options, [...model.options.profiles, ...declared.profiles], model.envFile), 'up', '-d', ...(action === 'build' ? ['--build'] : []), service]
-        return { terminalId: await openTerminal(path, `${action === 'build' ? 'build' : 'up'} ${service}`, args, bin) }
+        return { terminalId: await openTerminal(path, `${action === 'build' ? 'build' : 'up'} ${service}`, args, bin, { service }) }
       }
       if (id === null) throw invalid('The service has no container')
-      await run(bin, [action, id], { timeoutMs: 60_000, signal })
+      await operations.run(path, `${action} ${service}`, service, () => run(bin, [action, id], { timeoutMs: 60_000, signal }))
       return { terminalId: null }
     },
     'project.action': async (input, signal) => {
@@ -290,8 +334,8 @@ export default function activate(orca: OrcaWorkerApi): void {
       const bin = await docker()
       const model = await readProject(path, bin, true, signal)
       noForeign(model.foreign)
-      if (input.action === 'up') return { terminalId: await openTerminal(path, 'compose up', [...composeArgs(model.options, model.options.profiles, model.envFile), 'up', '-d'], bin) }
-      await run(bin, [...composeArgs(model.options, model.profiles, model.envFile), input.action], { cwd: path, timeoutMs: 115_000, signal })
+      if (input.action === 'up') return { terminalId: await openTerminal(path, 'compose up', [...composeArgs(model.options, model.options.profiles, model.envFile), 'up', '-d'], bin, { service: null }) }
+      await operations.run(path, `compose ${input.action}`, null, () => run(bin, [...composeArgs(model.options, model.profiles, model.envFile), input.action], { cwd: path, timeoutMs: 115_000, signal }))
       return { terminalId: null }
     },
     'container.shell': async (input, signal) => {
@@ -371,7 +415,9 @@ export default function activate(orca: OrcaWorkerApi): void {
     if (ticking) return
     ticking = true
     try {
-      const { project, rows } = await readProject(path, await docker())
+      const bin = await docker()
+      const { project, rows } = await readProject(path, bin)
+      await watchEvents(path, bin, { project })
       if (stopped || path !== focusedPath) return
       await updateStatus({ ...summarize(project, rows), visible: true })
       const fresh = tracker.update(rows, Date.now())

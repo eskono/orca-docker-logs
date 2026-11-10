@@ -20,7 +20,7 @@ export function mockHost(options: Options = {}) {
   }
 }
 
-export async function mountWorker(module: { default: (api: OrcaWorkerApi) => void; deactivate: () => void }, { host }: { host: ReturnType<typeof mockHost> }) {
+export async function mountWorker(module: { default: (api: OrcaWorkerApi) => void; deactivate: () => void | Promise<void> }, { host }: { host: ReturnType<typeof mockHost> }) {
   const handlers = new Map<string, (input: unknown, context: { signal: AbortSignal }) => Promise<unknown>>()
   const events = new Map<string, (payload: unknown) => unknown>()
   const api: OrcaWorkerApi = {
@@ -44,6 +44,6 @@ export async function mountWorker(module: { default: (api: OrcaWorkerApi) => voi
       return handler(input, { signal: new AbortController().signal })
     },
     async emit(name: string, payload: unknown) { await events.get(name)?.(payload) },
-    async deactivate() { module.deactivate(); handlers.clear(); events.clear() }
+    async deactivate() { await module.deactivate(); handlers.clear(); events.clear() }
   }
 }

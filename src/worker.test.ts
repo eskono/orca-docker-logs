@@ -50,6 +50,9 @@ case "$*" in
   "logs "*"${WORKER}")
     if [ -f "$here/fail-worker" ]; then echo "No such container" >&2; exit 1; fi
     printf '2026-01-01T00:00:02.500000000Z worker crash\\n' ;;
+  "--context default events "*)
+    if [ -f "$here/events.txt" ]; then cat "$here/events.txt"; fi
+    exec sleep 30 ;;
   "context show") echo default ;;
   "context inspect default --format {{json .Endpoints.docker.Host}}") echo '\"unix:///var/run/docker.sock\"' ;;
   stats*) printf '{"ID":"${APP}","CPUPerc":"1.50%%","MemUsage":"10MiB / 1GiB","MemPerc":"0.98%%"}\\n' ;;
@@ -97,6 +100,7 @@ async function setup() {
       },
       'workspace.readContext': null,
       'terminal.create': { terminalId: 'term_1' },
+      'terminal.read': () => ({ lines: (host.callsOf('terminal.create') as {command:string}[]).flatMap((call) => [...call.command.matchAll(/ORCA_DOCKER_DONE_([a-f0-9]{32})/g)].map((match) => `ORCA_DOCKER_DONE_${match[1]} 0`)), truncated: false }),
       'agent.launch': { terminalId: 'term_2' },
       'statusBar.update': { ok: true },
       'notifications.show': { delivered: true }
@@ -202,15 +206,15 @@ test('acts on containers in the background and opens terminals for long compose 
       ['w1', 'shell proj-app-1']
     ]
   )
-  assert.deepEqual(
-    terminals.map((t: Params) => t.command),
-    [
-      `cd ${project} && ${docker} --context default compose --profile web up -d caddy`,
-      `cd ${project} && ${docker} --context default compose up -d --build app`,
-      `cd ${project} && ${docker} --context default compose up -d`,
-      `cd ${project} && ${docker} --context default exec -it ${APP} sh -c 'command -v bash >/dev/null 2>&1 && exec bash || exec sh'`
-    ]
-  )
+  for (const terminal of terminals.slice(0, 3)) {
+    assert.match(terminal.command, /^sh -c /)
+    assert.match(terminal.command, /ORCA_DOCKER_DONE_/)
+    assert.ok(terminal.command.includes(`cd ${project} && ${docker} --context default compose`))
+  }
+  assert.ok(terminals[0].command.includes('--profile web up -d caddy'))
+  assert.ok(terminals[1].command.includes('up -d --build app'))
+  assert.equal(terminals[3].command, `cd ${project} && ${docker} --context default exec -it ${APP} sh -c 'command -v bash >/dev/null 2>&1 && exec bash || exec sh'`)
+
 
   // Orca opens them in the background; the worker brings each to the front.
   assert.deepEqual(await orcaCalls(), Array(4).fill('terminal switch --terminal term_1 --json'))
@@ -360,7 +364,7 @@ test('persists Compose files/profiles per workspace and applies them to commands
     assert.deepEqual(await worker.request('compose.get', { path: project }), { options })
     await worker.request('project.action', { path: project, action: 'up' })
     const call = host.callsOf('terminal.create').at(-1) as { command: string }
-    assert.equal(call.command, `cd ${project} && ${docker} --context default compose -f infra/stack.yml --profile web up -d`)
+    assert.ok(call.command.includes(`cd ${project} && ${docker} --context default compose -f infra/stack.yml --profile web up -d`))
     await worker.request('services.list', { path: project, fresh: true })
     assert.ok((await args()).includes('compose -f infra/stack.yml --profile web config --format json'))
     await assert.rejects(worker.request('compose.set', { path: project, options: { files: ['../inspect.json'], profiles: [] } }), { code: 'invalid_params' })
@@ -408,6 +412,49 @@ test('custom nested Compose files keep the workspace dotenv for config and termi
     await worker.request('compose.set', { path: project, options: { files: ['infra/stack.yml'], profiles: [] } })
     await worker.request('project.action', { path: project, action: 'up' })
     assert.ok((await args()).includes('compose --env-file .env -f infra/stack.yml --profile web config --format json'))
-    assert.match((host.callsOf('terminal.create').at(-1) as { command: string }).command, /compose --env-file .env -f infra\/stack.yml up -d$/)
+    assert.match((host.callsOf('terminal.create').at(-1) as { command: string }).command, /compose --env-file .env -f infra\/stack.yml up -d/)
   } finally { await worker.deactivate() }
+})
+
+test('saves views per authorized workspace and rejects invalid view configurations', async (t) => {
+  const { worker, project, plain } = await setup()
+  t.after(() => worker.deactivate())
+  const view = { id: 'api', name: 'API errors', services: ['app', 'worker'], filter: 'trace_id=abc', search: 'failed', level: 'error', window: '15m', group: true, json: false, wrap: true, timestamps: false }
+  assert.deepEqual(await worker.request('views.set', { path: project, views: [view] }), { views: [view] })
+  assert.deepEqual(await worker.request('views.get', { path: project }), { views: [view] })
+  assert.deepEqual(await worker.request('views.get', { path: plain }), { views: [] })
+  await assert.rejects(worker.request('views.get', { path: '/foreign' }), { code: 'not_permitted' })
+  await assert.rejects(worker.request('views.set', { path: project, views: [{ ...view, window: 'event' }] }), { code: 'invalid_params' })
+})
+
+test('operation terminals can only be opened through their own workspace history', async (t) => {
+  const { worker, project, plain, host } = await setup()
+  t.after(() => worker.deactivate())
+  await worker.request('service.action', { path: project, service: 'app', containerId: APP, action: 'build' })
+  const { operations } = await worker.request('operations.list', { path: project })
+  assert.equal(operations[0].status, 'succeeded')
+  assert.equal(operations[0].terminalId, 'term_1')
+  await worker.request('operations.open', { path: project, id: operations[0].id })
+  await assert.rejects(worker.request('operations.open', { path: plain, id: operations[0].id }), { code: 'not_permitted' })
+  assert.ok(host.callsOf('terminal.read').length > 0)
+})
+
+test('event recording checks workspace ownership and bounded log requests pass until to Docker', async (t) => {
+  const { worker, project, root, args } = await setup()
+  t.after(() => worker.deactivate())
+  const event = (workingDir: string, action: string) => JSON.stringify({ Type: 'container', Action: action, time: 1767225601, Actor: { ID: APP, Attributes: { name: 'proj-app-1', 'com.docker.compose.service': 'app', 'com.docker.compose.project': 'proj', 'com.docker.compose.project.working_dir': workingDir } } })
+  await writeFile(join(root, 'events.txt'), event(project, 'oom') + '\n' + event('/foreign', 'destroy') + '\n')
+  await worker.request('events.list', { path: project })
+  let history: any
+  for (let i = 0; i < 10; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    history = await worker.request('events.list', { path: project })
+    if (history.events.length) break
+  }
+  assert.deepEqual(history.events.map((event: any) => event.action), ['oom'])
+  const target = { service: 'app', containerId: APP, name: 'proj-app-1', since: '2026-01-01T00:00:00Z', until: '2026-01-01T00:01:00Z' }
+  await worker.request('logs.get', { path: project, targets: [target] })
+  assert.ok((await args()).some((arg) => arg.includes('--since 2026-01-01T00:00:00Z --until 2026-01-01T00:01:00Z')))
+  await assert.rejects(worker.request('logs.get', { path: project, targets: [{ ...target, until: '2025-01-01T00:00:00Z' }] }), { code: 'invalid_params' })
+  await assert.rejects(worker.request('events.list', { path: '/foreign' }), { code: 'not_permitted' })
 })

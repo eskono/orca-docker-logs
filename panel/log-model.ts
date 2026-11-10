@@ -44,7 +44,7 @@ export function matchesFilter(item: Shown, query: string): boolean {
 export const isCorrelation = (key: string) => /(?:^|\.)(?:request_?id|trace_?id|correlation_?id)$/i.test(key)
 
 /** Collapse whole error records per container, preserving each representative stack trace. */
-export function groupErrors(items: Shown[]): Shown[] {
+export function logRecords(items: Shown[], group = false): Shown[] {
   type Block = { at: number; items: Shown[] }
   const pending = new Map<string, Block>()
   const blocks: Block[] = []
@@ -52,8 +52,9 @@ export function groupErrors(items: Shown[]): Shown[] {
   items.forEach((item, at) => {
     const source = item.line.containerId ?? item.line.src ?? ''
     if (!item.level) { flush(source); blocks.push({ at, items: [item] }); return }
-    const header = levelOf(item.text) && !/^\s|^Traceback |\b\w+(?:Error|Exception):/.test(item.text)
     const previous = pending.get(source)
+    const pythonEnd = previous?.items.some((line) => /^Traceback |^\s*File ["']/.test(line.text)) && /^\w+(?:Error|Exception):/.test(item.text)
+    const header = levelOf(item.text) && !/^\s|^Traceback /.test(item.text) && !pythonEnd
     const anotherTrace = /^Traceback /.test(item.text) && previous?.items.some((line) => /^Traceback /.test(line.text))
     if (header || anotherTrace || previous?.items[0].level !== item.level) flush(source)
     if (!pending.has(source)) pending.set(source, { at, items: [] })
@@ -66,7 +67,7 @@ export function groupErrors(items: Shown[]): Shown[] {
     const first = block.items[0]
     const text = block.items.map((item) => item.text).join('\n')
     const key = JSON.stringify([first.line.containerId ?? first.line.src, first.level, text])
-    const existing = first.level ? grouped.get(key) : undefined
+    const existing = group && first.level ? grouped.get(key) : undefined
     if (existing) { existing.count++; continue }
     const record = { ...first, text, line: { ...first.line, m: block.items.map((item) => item.line.m).join('\n') } }
     if (first.level) grouped.set(key, record)
@@ -74,6 +75,8 @@ export function groupErrors(items: Shown[]): Shown[] {
   }
   return result
 }
+
+export const groupErrors = (items: Shown[]): Shown[] => logRecords(items, true)
 
 /** Keep surrounding unfiltered lines from the affected source instead of sending only isolated errors. */
 export function incidentLines(all: Shown[], visible: Shown[]): Shown[] {

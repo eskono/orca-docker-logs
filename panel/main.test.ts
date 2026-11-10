@@ -50,6 +50,10 @@ async function panel(override: Override = () => undefined) {
         if (result !== undefined) return result
         switch (name) {
           case 'workspaces.list': return { workspaces: [A, B], focused: input.context?.displayName === 'B' ? B : A }
+          case 'operations.list': return { operations: [] }
+          case 'events.list': return { events: [], connected: true, error: null, startedAt: new Date().toISOString(), limited: false }
+          case 'views.get': return { views: [] }
+          case 'views.set': return { views: input.views }
           case 'compose.get': return { options: { files: [], profiles: [] } }
           case 'services.list': return { project: input.path, rows: [row(input.path)], options: { files: [], profiles: [] }, profiles: ['web'], context: { name: 'default', endpoint: 'unix:///var/run/docker.sock', remote: false } }
           case 'stats.get': return { stats: {} }
@@ -202,4 +206,100 @@ test('diagnostics show OOM details and database ports copy addresses instead of 
   port.click(); await settle()
   assert.equal(ui.copied.at(-1), 'localhost:5433')
   assert.equal(ui.element('services').querySelectorAll('.port').length, 1)
+})
+
+test('search preserves context, navigates collapsed traces and keeps full text for Copy', async (t) => {
+  const trace = ['INFO before', 'TypeError: failed', '  at library (/app/node_modules/lib/index.js:1:2)', '  at handler (/app/src/main.ts:4:2)', 'INFO after']
+  const ui = await panel((name) => {
+    if (name === 'logs.get') return answer(trace.map((m, i) => line(m, i)))
+    if (name === 'code.resolve') return { files: { '/app/src/main.ts': 'src/main.ts' } }
+  })
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  const details = ui.element('log').querySelector<HTMLDetailsElement>('.trace')!
+  assert.equal(details.open, false)
+  assert.equal(details.querySelectorAll('.trace-project').length, 1)
+  assert.equal(details.querySelectorAll('.trace-library').length, 1)
+  const search = ui.element<HTMLInputElement>('search')
+  search.value = 'handler'; search.dispatchEvent(new ui.window.Event('input'))
+  assert.match(ui.element('search-count').textContent!, /1 \/ 1/)
+  assert.match(ui.element('log').textContent!, /INFO before/)
+  assert.match(ui.element('log').textContent!, /INFO after/)
+  ui.element<HTMLButtonElement>('search-next').click()
+  assert.equal(ui.element('log').querySelector<HTMLDetailsElement>('.trace')!.open, true)
+  ui.element<HTMLButtonElement>('copy').click(); await settle()
+  assert.match(ui.copied.at(-1)!, /library.*\n.*handler/)
+  assert.doesNotMatch(ui.copied.at(-1)!, /stack frames/)
+  ui.element<HTMLButtonElement>('error-next').click()
+  assert.equal(ui.element('log').querySelectorAll('.current-error').length, 1)
+})
+
+test('operation output and terminal access remain visible while a command runs', async (t) => {
+  const ui = await panel((name) => name === 'operations.list' ? { operations: [{ id: 'build-1', title: 'Build app', service: 'app', terminalId: 'terminal-1', status: 'running', startedAt: '2026-01-01T00:00:00Z', finishedAt: null, exitCode: null, lines: ['[2/4] compiling'] }] } : name === 'operations.open' ? { opened: true } : undefined)
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  assert.equal(ui.element<HTMLDetailsElement>('operations').open, true)
+  assert.match(ui.element('operations-list').textContent!, /compiling/)
+  assert.equal(ui.element<HTMLButtonElement>('project-up').disabled, true)
+  ui.element('operations-list').querySelector<HTMLButtonElement>('button')!.click(); await settle()
+  assert.deepEqual(ui.requests.find((request) => request.name === 'operations.open')!.input, { path: A.path, id: 'build-1' })
+})
+
+test('event navigation reads a bounded log period, pauses follow and retains removed-container history', async (t) => {
+  const event = { id: 'evt', t: '2026-01-01T00:00:03.123456789Z', containerId: row(A.path).containerId, name: 'A-app-1', service: 'app', action: 'oom', detail: '' }
+  const ui = await panel((name) => name === 'events.list' ? { events: [event, { ...event, id: 'removed', containerId: 'c'.repeat(64), action: 'destroy' }], connected: true, error: null, startedAt: event.t, limited: false } : undefined)
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  ui.element('events-list').querySelector<HTMLButtonElement>('button')!.click(); await settle()
+  const target = ui.requests.filter((request) => request.name === 'logs.get').at(-1)!.input.targets[0]
+  assert.equal(target.since, '2025-12-31T23:59:33.123Z')
+  assert.equal(target.until, '2026-01-01T00:00:33.123Z')
+  assert.equal(ui.element<HTMLInputElement>('follow').checked, false)
+  assert.equal(ui.element<HTMLSelectElement>('window').value, 'event')
+  ui.element('events-list').querySelectorAll<HTMLButtonElement>('button')[1].click()
+  assert.match(ui.element('notice').textContent!, /removed/)
+  ui.element<HTMLButtonElement>('live').click(); await settle()
+  assert.equal(ui.element<HTMLInputElement>('follow').checked, true)
+  assert.equal(ui.element<HTMLSelectElement>('window').value, 'tail')
+  assert.equal(ui.requests.filter((request) => request.name === 'logs.get').at(-1)!.input.targets[0].until, undefined)
+})
+
+test('combines selected services and restores a saved view only in its project', async (t) => {
+  const data = new Map<string, any[]>()
+  const ui = await panel((name, input) => {
+    if (name === 'services.list') return { project: input.path, rows: [row(input.path), row(input.path, { key: 'c'.repeat(64), containerId: 'c'.repeat(64), name: 'db-1', service: 'db' })], options: { files: [], profiles: [] }, profiles: [], context: { name: 'default', endpoint: '', remote: false } }
+    if (name === 'views.get') return { views: data.get(input.path) ?? [] }
+    if (name === 'views.set') { data.set(input.path, structuredClone(input.views)); return { views: input.views } }
+  })
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  const db = ui.element('services').querySelector<HTMLInputElement>('[aria-label="Include db in combined logs"]')!
+  db.checked = true; db.dispatchEvent(new ui.window.Event('change')); await settle()
+  assert.deepEqual(ui.requests.filter((request) => request.name === 'logs.get').at(-1)!.input.targets.map((target: any) => target.service), ['app', 'db'])
+  const filter = ui.element<HTMLInputElement>('filter'); filter.value = 'ERROR'; filter.dispatchEvent(new ui.window.Event('input'))
+  const level = ui.element<HTMLSelectElement>('level'); level.value = 'error'; level.dispatchEvent(new ui.window.Event('change'))
+  const viewName = ui.element<HTMLInputElement>('view-name'); viewName.value = 'API + DB'; viewName.dispatchEvent(new ui.window.Event('input'))
+  ui.element<HTMLButtonElement>('view-save').click(); await settle()
+  assert.deepEqual(data.get(A.path)![0].services, ['app', 'db'])
+  ui.focus(B); await settle()
+  assert.equal(ui.element<HTMLSelectElement>('saved-view').options.length, 1)
+  ui.focus(A); await settle()
+  filter.value = ''; level.value = 'all'
+  const select = ui.element<HTMLSelectElement>('saved-view'); select.value = data.get(A.path)![0].id; select.dispatchEvent(new ui.window.Event('change')); await settle()
+  assert.equal(filter.value, 'ERROR')
+  assert.equal(level.value, 'error')
+  assert.deepEqual(ui.requests.filter((request) => request.name === 'logs.get').at(-1)!.input.targets.map((target: any) => target.service), ['app', 'db'])
+  ui.element<HTMLButtonElement>('view-delete').click(); await settle()
+  assert.equal(data.get(A.path)!.length, 0)
+})
+
+test('delayed saved-view responses cannot replace a newly selected workspace', async (t) => {
+  const pending: ReturnType<typeof deferred>[] = []
+  const ui = await panel((name) => { if (name === 'views.get') { const wait = deferred(); pending.push(wait); return wait.promise } })
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle(); ui.focus(B); await settle(); ui.focus(A); await settle()
+  pending[2].resolve({ views: [] }); await settle()
+  pending[0].resolve({ views: [{ id: 'old', name: 'Old view' }] }); pending[1].resolve({ views: [{ id: 'wrong', name: 'Other project' }] }); await settle()
+  assert.equal(ui.element<HTMLSelectElement>('saved-view').options.length, 1)
+  assert.equal(ui.element<HTMLSelectElement>('workspace').value, A.path)
 })

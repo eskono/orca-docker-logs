@@ -7,6 +7,10 @@ import type {
   FocusContext,
   LogLine,
   LogTarget,
+  Operation,
+  ContainerEvent,
+  EventHistory,
+  SavedView,
   ProjectAction,
   Requests,
   ServiceAction,
@@ -22,9 +26,12 @@ import { findLinks, type LogLink } from './links'
 import { parseBytes, parsePercent, sparkPoints } from './sparkline'
 import { RequestGate } from './requests'
 import { LogBuffer } from './log-buffer'
-import { analyze, groupErrors, incidentLines, isCorrelation, matchesFilter, type Shown } from './log-model'
+import { analyze, logRecords, incidentLines, isCorrelation, matchesFilter, type Shown } from './log-model'
 import { reconcileLog } from './log-view'
 import { portAddress } from './ports'
+import { findMatches, highlightMatches, revealLogNode, SearchNavigation } from './search'
+import { renderOperations } from './operations-view'
+import { traceLines } from './traces'
 
 type Orca = {
   on(event: 'workspace.changed', handler: (payload: { context: FocusContext }) => void): unknown
@@ -47,6 +54,7 @@ const INFO_NOTICE_MS = 8000
 const DOWN_CONFIRM_MS = 4000
 /** The pseudo-row that shows every container's log at once. */
 const ALL = 'all'
+const GROUP = 'selection'
 const WINDOWS: Record<string, number> = { '5m': 5 * 60_000, '15m': 15 * 60_000, '1h': 60 * 60_000 }
 const SOURCE_COLORS = [2, 4, 5, 6, 3, 10, 12, 13, 14, 11]
 
@@ -86,7 +94,24 @@ const els = {
   group: $<HTMLInputElement>('group-errors'),
   json: $<HTMLInputElement>('json-fields'),
   copy: $<HTMLButtonElement>('copy'),
-  resize: $<HTMLDivElement>('services-resize')
+  resize: $<HTMLDivElement>('services-resize'),
+  search: $<HTMLInputElement>('search'),
+  searchCount: $<HTMLSpanElement>('search-count'),
+  searchPrevious: $<HTMLButtonElement>('search-previous'),
+  searchNext: $<HTMLButtonElement>('search-next'),
+  errorPrevious: $<HTMLButtonElement>('error-previous'),
+  errorNext: $<HTMLButtonElement>('error-next'),
+  operations: $<HTMLDetailsElement>('operations'),
+  operationsTitle: $<HTMLSpanElement>('operations-title'),
+  operationsList: $<HTMLDivElement>('operations-list'),
+  events: $<HTMLDetailsElement>('events'),
+  eventsTitle: $<HTMLSpanElement>('events-title'),
+  eventsList: $<HTMLDivElement>('events-list'),
+  live: $<HTMLButtonElement>('live'),
+  savedView: $<HTMLSelectElement>('saved-view'),
+  viewName: $<HTMLInputElement>('view-name'),
+  viewSave: $<HTMLButtonElement>('view-save'),
+  viewDelete: $<HTMLButtonElement>('view-delete')
 }
 
 const state = {
@@ -116,10 +141,13 @@ const state = {
   options: { files: [], profiles: [] } as ComposeOptions,
   availableProfiles: [] as string[],
   logWarnings: [] as string[],
-  limits: [] as string[]
+  limits: [] as string[],
+  operations: [] as Operation[],
+  events: null as EventHistory | null,
+  selectedServices: null as string[] | null
 }
 /** The row last viewed in each project, picked again when the project comes back. */
-const lastSelection = new Map<string, { key: string; service: string | null }>()
+const lastSelection = new Map<string, { key: string; service: string | null; services: string[] | null }>()
 /** Log rendering scope: navigation and Clear must not reuse nodes from a previous selection. */
 let generation = 0
 const serviceRequests = new RequestGate()
@@ -127,11 +155,22 @@ const logRequests = new RequestGate()
 const statRequests = new RequestGate()
 const focusRequests = new RequestGate()
 const configRequests = new RequestGate()
+const operationRequests = new RequestGate()
+const eventRequests = new RequestGate()
+const viewRequests = new RequestGate()
+let views: SavedView[] = []
+let viewsLoaded = false
+let viewsSaving = false
 const buffer = new LogBuffer()
 let sourceRevision = 0
 let pathRevision = 0
 let clearing = false
 let asking = false
+const searchNavigation = new SearchNavigation()
+let searchLimited = false
+let lastErrorNode: HTMLElement | null = null
+let eventRange: { since: string; until: string } | null = null
+const expandedTraces = new Map<string, boolean>()
 
 /** Resource samples per container, newest last, from each `stats.get` while the panel is open. */
 const HISTORY_SAMPLES = 60
@@ -152,6 +191,7 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
 const selectedRow = () => state.rows.find((r) => r.key === state.key) ?? null
 const showingAll = () => state.key === ALL
 const containers = () => state.rows.filter((r) => r.containerId)
+const selectedRows = () => showingAll() ? state.rows : state.key === GROUP ? state.rows.filter((r) => state.selectedServices?.includes(r.service)) : state.rows.filter((r) => r.key === state.key)
 const basename = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1) ?? path
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string) {
@@ -184,6 +224,8 @@ function age(since: string | null): string {
 }
 
 function statusText(row: ServiceRow): string {
+  const operation = state.operations.find((operation) => operation.status === 'running' && (!operation.service || operation.service === row.service))
+  if (operation) return `${operation.title}…`
   if (state.busy.has(row.key)) return 'Working…'
   switch (row.state) {
     case 'running':
@@ -259,7 +301,7 @@ function renderWorkspaces(): void {
 }
 
 function renderProjectActions(): void {
-  const idle = !!state.path && state.servicesLoaded && !state.projectBusy
+  const idle = !!state.path && state.servicesLoaded && !state.projectBusy && !state.operations.some((operation) => operation.status === 'running')
   els.up.disabled = !idle
   els.restart.disabled = !idle || containers().length === 0
   els.down.disabled = !idle || containers().length === 0
@@ -347,7 +389,7 @@ function renderServices(): void {
   const replicas = new Map<string, number>()
   for (const row of state.rows) replicas.set(row.service, (replicas.get(row.service) ?? 0) + 1)
   const items = state.rows.map((row) => {
-    const selected = row.key === state.key
+    const selected = row.key === state.key || state.key === GROUP && !!state.selectedServices?.includes(row.service)
     const item = el('li', selected ? 'service selected' : 'service')
     const pick = el('button', 'pick')
     pick.setAttribute('aria-pressed', String(selected))
@@ -366,7 +408,17 @@ function renderServices(): void {
     )
     pick.append(el('span', `dot ${tone(row)}`), text)
     pick.addEventListener('click', () => selectKey(row.key, row.service))
-    item.append(pick)
+    const check = el('input', 'service-select')
+    check.type = 'checkbox'
+    check.checked = selectedRows().some((r) => r.service === row.service)
+    check.setAttribute('aria-label', `Include ${row.service} in combined logs`)
+    check.addEventListener('change', () => {
+      const services = new Set(selectedRows().map((r) => r.service))
+      if (check.checked) services.add(row.service)
+      else services.delete(row.service)
+      selectKey(GROUP, null, [...services].sort())
+    })
+    item.append(check, pick)
 
     const side = el('span', 'side')
     if (usage) {
@@ -399,7 +451,7 @@ function renderServices(): void {
     if (side.childNodes.length) item.append(side)
 
     const actions = el('span', 'actions')
-    for (const [name, label, onPress] of rowActions(row)) actions.append(iconButton(name, label, onPress, state.busy.has(row.key)))
+    for (const [name, label, onPress] of rowActions(row)) actions.append(iconButton(name, label, onPress, state.busy.has(row.key) || !!state.projectBusy || state.operations.some((operation) => operation.status === 'running' && (!operation.service || operation.service === row.service))))
     item.append(actions)
     return item
   })
@@ -410,7 +462,7 @@ function renderServices(): void {
 }
 
 function renderDiagnostics(): void {
-  const rows = showingAll() ? containers() : [selectedRow()].filter((row): row is ServiceRow => !!row)
+  const rows = selectedRows()
   els.diagnostics.hidden = rows.length === 0
   const problems = rows.map((row) => problemOf(row)).filter(Boolean)
   els.diagnosticTitle.textContent = problems.length ? `Diagnostics · ${problems.length} problem${problems.length === 1 ? '' : 's'}` : 'Container diagnostics'
@@ -495,12 +547,8 @@ function linkified(text: string, wrap: (piece: string) => Node, service: string 
   return nodes
 }
 
-function renderLine({ line, level, fields, count }: Shown, withTime: boolean, sourceWidth: number, service: string | null): HTMLElement {
-  const node = el('div', ['line', line.e ? 'err' : '', level ? `lvl-${level}` : ''].filter(Boolean).join(' '))
-  if (withTime && line.t) node.append(el('span', 'ts', `${formatTime(line.t)} `))
-  if (line.src) node.append(el('span', `src f${sourceColor(line.src)}`, `${line.src.padEnd(sourceWidth)} │ `))
-  if (count > 1) node.append(el('span', 'repeat-count', `×${count} `))
-  const segments = parseAnsi(line.m)
+function appendLogText(target: HTMLElement, raw: string, service: string | null): void {
+  const segments = parseAnsi(raw)
   const plain = (piece: string) => document.createTextNode(piece)
   if (segments.every((s) => Object.keys(s.style).length === 0)) {
     // Most programs drop their colours when Docker, not a terminal, reads their output: colour the
@@ -508,18 +556,60 @@ function renderLine({ line, level, fields, count }: Shown, withTime: boolean, so
     const text = segments.map((s) => s.text).join('')
     const token = levelToken(text)
     if (token) {
-      node.append(
+      target.append(
         ...linkified(text.slice(0, token.start), plain, service),
         el('span', `level-word ${token.tone}`, text.slice(token.start, token.end)),
         ...linkified(text.slice(token.end), plain, service)
       )
     } else if (text) {
-      node.append(...linkified(text, plain, service))
+      target.append(...linkified(text, plain, service))
     }
   } else {
-    for (const segment of segments) node.append(...linkified(segment.text, (piece) => styled(piece, segment.style), service))
+    for (const segment of segments) target.append(...linkified(segment.text, (piece) => styled(piece, segment.style), service))
   }
-  if (node.childNodes.length === 0) node.append('​') // keep empty lines one line tall
+}
+
+function renderLine({ line, level, fields, count }: Shown, withTime: boolean, sourceWidth: number, service: string | null, searchLimit = 0): HTMLElement {
+  const node = el('div', ['line', line.e ? 'err' : '', level ? `lvl-${level}` : ''].filter(Boolean).join(' '))
+  if (withTime && line.t) node.append(el('span', 'ts', `${formatTime(line.t)} `))
+  if (line.src) node.append(el('span', `src f${sourceColor(line.src)}`, `${line.src.padEnd(sourceWidth)} │ `))
+  if (count > 1) node.append(el('span', 'repeat-count', `×${count} `))
+  const message = el('span', 'log-message')
+  const trace = traceLines(line.m, (file) => sources.get(`${service}\0${file}`))
+  const physical = line.m.split('\n')
+  const first = trace?.findIndex((part) => part.frame) ?? -1
+  let last = trace ? trace.findLastIndex((part) => part.frame) : -1
+  while (last >= 0 && last + 1 < physical.length && /^\s+\S/.test(physical[last + 1])) last++
+  const traceKey = JSON.stringify([generation, line.containerId, line.src, line.t, line.m])
+  const appendLines = (target: HTMLElement, from: number, to: number) => {
+    for (let i = from; i < to; i++) {
+      const part = el('span', trace?.[i].frame ? `trace-frame trace-${trace[i].kind}` : undefined)
+      appendLogText(part, physical[i], service)
+      target.append(part)
+      if (i < physical.length - 1) target.append('\n')
+    }
+  }
+  if (first >= 0 && trace) {
+    appendLines(message, 0, first)
+    const details = el('details', 'trace')
+    const frames = trace.filter((part) => part.frame)
+    const project = frames.filter((part) => part.kind === 'project').length
+    const library = frames.filter((part) => part.kind === 'library').length
+    const summary = el('summary', undefined, `${frames.length} stack frames · ${project} project · ${library} library`)
+    summary.setAttribute('data-search-ignore', '')
+    details.open = expandedTraces.get(traceKey) ?? false
+    details.addEventListener('toggle', () => {
+      expandedTraces.set(traceKey, details.open)
+      if (expandedTraces.size > 1000) expandedTraces.delete(expandedTraces.keys().next().value!)
+    })
+    details.append(summary)
+    appendLines(details, first, last + 1)
+    message.append(details)
+    appendLines(message, last + 1, physical.length)
+  } else appendLines(message, 0, physical.length)
+  if (message.childNodes.length === 0) message.append('​') // keep empty lines one line tall
+  if (searchLimit) highlightMatches(message, els.search.value, searchLimit)
+  node.append(message)
   if (els.json.checked && fields) {
     const details = el('details', 'json-fields')
     details.append(el('summary', undefined, 'JSON fields'))
@@ -546,7 +636,7 @@ function logPlaceholder(): string | null {
   const row = selectedRow()
   if (state.logError) return state.logError
   if (!state.path) return 'Choose a project to see its containers.'
-  if (showingAll()) return containers().length ? null : 'No containers yet.'
+  if (showingAll() || state.key === GROUP) return selectedRows().some((r) => r.containerId) ? null : 'No containers for these services yet.'
   if (!row) return !state.servicesLoaded ? 'Loading…' : state.rows.length ? 'Choose a container.' : 'No containers.'
   if (!row.containerId) return 'This service has no container yet. Start it to create one.'
   return null
@@ -556,14 +646,17 @@ function renderLog(scrollToEnd = false): void {
   const pane = els.log
   const atEnd = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 32
   const row = selectedRow()
-  const hasLog = showingAll() ? containers().length > 0 : !!row?.containerId
-  els.logTitle.textContent = showingAll() ? 'Logs · all services' : row ? `Logs · ${row.name}` : 'Logs'
+  const hasLog = selectedRows().some((r) => r.containerId)
+  els.logTitle.textContent = showingAll() ? 'Logs · all services' : state.key === GROUP ? `Logs · ${state.selectedServices?.join(', ') || 'no services'}` : row ? `Logs · ${row.name}` : 'Logs'
+  els.live.hidden = !eventRange
   els.clear.disabled = !hasLog || clearing
   els.showAll.disabled = clearing
   els.cleared.hidden = !state.clearedAt
   els.clearedText.textContent = state.clearedAt ? `Lines before ${formatTime(state.clearedAt)} are hidden.` : ''
   pane.classList.toggle('wrap', els.wrap.checked)
   const entries: { key: string; create: () => HTMLElement }[] = []
+  let searchBudget = 1000
+  searchLimited = false
   const placeholder = logPlaceholder()
   const shown = placeholder ? [] : visibleLines()
   if (placeholder) entries.push({ key: `placeholder:${placeholder}`, create: () => el('div', 'placeholder', placeholder) })
@@ -573,14 +666,18 @@ function renderLog(scrollToEnd = false): void {
       entries.push({ key: text, create: () => el('div', 'placeholder', text) })
     }
     for (const warning of state.logWarnings) entries.push({ key: `warning:${warning}`, create: () => el('div', 'placeholder log-warning', warning) })
-    const records = els.group.checked ? groupErrors(shown) : shown
+    const records = logRecords(shown, els.group.checked)
     const sourceWidth = Math.max(0, ...records.map((item) => item.line.src?.length ?? 0))
     const serviceByName = new Map(state.rows.map((r) => [r.name, r.service]))
     const serviceById = new Map(state.rows.map((r) => [r.containerId, r.service]))
     for (const item of records) {
       const service = item.line.containerId ? serviceById.get(item.line.containerId) ?? null : item.line.src ? serviceByName.get(item.line.src) ?? null : row?.service ?? null
-      const key = JSON.stringify([item.line, item.level, item.count, els.timestamps.checked, els.json.checked, sourceWidth, sourceRevision, generation, service])
-      entries.push({ key, create: () => renderLine(item, els.timestamps.checked, sourceWidth, service) })
+      const matches = findMatches(item.text, els.search.value, searchBudget + 1)
+      const searchLimit = Math.min(searchBudget, matches.length)
+      searchLimited ||= matches.length > searchBudget
+      searchBudget -= searchLimit
+      const key = JSON.stringify([item.line, item.level, item.count, els.timestamps.checked, els.json.checked, sourceWidth, sourceRevision, generation, service, els.search.value, searchLimit])
+      entries.push({ key, create: () => renderLine(item, els.timestamps.checked, sourceWidth, service, searchLimit) })
     }
     if (!records.length) {
       const text = els.filter.value.trim() || els.level.value !== 'all' ? 'No lines match.' : 'No log lines yet.'
@@ -591,7 +688,9 @@ function renderLog(scrollToEnd = false): void {
   els.save.disabled = shown.length === 0
   els.copy.disabled = shown.length === 0
   reconcileLog(pane, entries)
-  if (scrollToEnd || (els.follow.checked && atEnd)) pane.scrollTop = pane.scrollHeight
+  searchNavigation.refresh(pane)
+  renderSearchCount()
+  if (scrollToEnd || (els.follow.checked && atEnd && !els.search.value)) pane.scrollTop = pane.scrollHeight
   if (unresolved.size) void resolveSources()
 }
 
@@ -673,7 +772,7 @@ function setPath(path: string | null): void {
   clearing = false
   state.projectBusy = null
   state.busy.clear()
-  for (const lane of [serviceRequests, statRequests, configRequests]) lane.invalidate()
+  for (const lane of [serviceRequests, statRequests, configRequests, operationRequests, eventRequests, viewRequests]) lane.invalidate()
   resetLogs()
   setNotice(projectHint())
   state.project = ''
@@ -683,9 +782,23 @@ function setPath(path: string | null): void {
   state.availableProfiles = []
   state.dockerContext = { name: 'loading…', endpoint: '', remote: false }
   const last = path ? lastSelection.get(path) : undefined
+  eventRange = null
+  expandedTraces.clear()
+  state.selectedServices = last?.services ?? null
   state.key = last?.key ?? null
   state.service = last?.service ?? null
   state.stats = {}
+  state.operations = []
+  views = []
+  viewsLoaded = false
+  viewsSaving = false
+  els.savedView.value = ''
+  els.viewName.value = ''
+  renderViews()
+  state.events = null
+  els.eventsList.replaceChildren()
+  els.eventsTitle.textContent = 'Container events'
+  els.operations.hidden = true
   history.clear()
   sources.clear()
   unresolved.clear()
@@ -699,9 +812,146 @@ function setPath(path: string | null): void {
   renderWorkspaces()
   renderServices()
   renderLog(true)
-  if (path) void loadComposeOptions()
+  if (path) { void loadComposeOptions(); void loadOperations(); void loadEvents(); void loadViews() }
   void loadServices()
 }
+
+async function loadOperations(force = false): Promise<void> {
+  const path = state.path
+  if (!path) return
+  const ticket = operationRequests.begin(force)
+  if (!ticket) return
+  try {
+    const { operations } = await orca.plugin.request('operations.list', { path }, { signal: ticket.signal })
+    if (!operationRequests.current(ticket)) return
+    const changed = JSON.stringify(operations) !== JSON.stringify(state.operations)
+    if (operations.some((op) => op.status === 'running' && !state.operations.some((old) => old.id === op.id))) els.operations.open = true
+    state.operations = operations
+    const active = operations.find((operation) => operation.status === 'running')
+    els.operations.hidden = operations.length === 0
+    els.operationsTitle.textContent = active ? `Operations · ${active.title} · running` : 'Recent operations'
+    renderOperations(els.operationsList, operations, (id) => {
+      void orca.plugin.request('operations.open', { path, id }).catch((error) => { if (state.path === path) setNotice(errorText(error), true) })
+    })
+    if (changed) renderServices()
+  } catch (error) {
+    if (operationRequests.current(ticket)) {
+      els.operations.hidden = false
+      els.operationsTitle.textContent = `Operations unavailable: ${errorText(error)}`
+    }
+  } finally { operationRequests.finish(ticket) }
+}
+
+function renderEvents(): void {
+  const history = state.events
+  els.events.hidden = !state.path
+  els.eventsTitle.textContent = !history ? 'Container events · loading…' : `Container events · ${history.connected ? 'watching' : 'disconnected'}${history.limited ? ' · older events omitted' : ''}`
+  const services = showingAll() ? null : state.key === GROUP ? state.selectedServices : state.service ? [state.service] : null
+  const events = history?.events.filter((event) => !services || services.includes(event.service)) ?? []
+  const entries = events.map((event) => ({ key: event.id, create: () => {
+    const row = el('div', 'event')
+    const button = el('button', 'link', `${event.t.slice(0, 10)} ${formatTime(event.t)} ${event.name} · ${event.action}${event.detail ? ` · ${event.detail}` : ''}`)
+    button.title = 'Show logs 30 seconds before and after this event'
+    button.addEventListener('click', () => jumpToEvent(event))
+    row.append(button)
+    return row
+  } }))
+  if (history?.error) entries.unshift({ key: history.error, create: () => el('div', 'hint', history.error!) })
+  if (!events.length) entries.push({ key: 'empty', create: () => el('div', 'hint', 'No observed events for these services. History is recorded while this project is watched.') })
+  reconcileLog(els.eventsList, entries)
+}
+
+async function loadEvents(): Promise<void> {
+  const path = state.path
+  if (!path) return
+  const ticket = eventRequests.begin()
+  if (!ticket) return
+  try {
+    const history = await orca.plugin.request('events.list', { path }, { signal: ticket.signal })
+    if (!eventRequests.current(ticket)) return
+    state.events = history
+    renderEvents()
+  } catch (error) {
+    if (eventRequests.current(ticket)) { els.eventsTitle.textContent = `Container events unavailable: ${errorText(error)}` }
+  } finally { eventRequests.finish(ticket) }
+}
+
+function jumpToEvent(event: ContainerEvent): void {
+  const row = state.rows.find((row) => row.containerId === event.containerId)
+  if (!row) { setNotice('This container was removed. Its event history is retained, but Docker no longer has its logs.'); return }
+  // Set the selection directly so no unbounded log request races the event window.
+  state.key = row.key; state.service = row.service; state.selectedServices = null
+  eventRange = { since: new Date(Date.parse(event.t) - 30_000).toISOString(), until: new Date(Date.parse(event.t) + 30_000).toISOString() }
+  els.window.value = 'event'
+  els.follow.checked = false
+  resetLogs(); renderServices(); renderEvents(); renderLog()
+  void loadLogs(true)
+}
+
+els.live.addEventListener('click', () => {
+  eventRange = null; els.window.value = 'tail'; els.follow.checked = true
+  resetLogs(); renderLog(true); savePrefs(); void loadLogs(true)
+})
+
+function renderViews(): void {
+  const selected = els.savedView.value
+  const placeholder = el('option', undefined, viewsLoaded ? 'Saved views…' : 'Loading views…')
+  placeholder.value = ''
+  const options = views.map((view) => { const option = el('option', undefined, view.name); option.value = view.id; return option })
+  els.savedView.replaceChildren(placeholder, ...options)
+  els.savedView.value = views.some((view) => view.id === selected) ? selected : ''
+  els.savedView.disabled = !viewsLoaded || viewsSaving
+  els.viewSave.disabled = !state.path || !viewsLoaded || viewsSaving || !els.viewName.value.trim()
+  els.viewDelete.disabled = !els.savedView.value || viewsSaving
+}
+async function loadViews(): Promise<void> {
+  const path = state.path
+  if (!path) return
+  const ticket = viewRequests.begin(true)!
+  try {
+    const answer = await orca.plugin.request('views.get', { path }, { signal: ticket.signal })
+    if (!viewRequests.current(ticket)) return
+    views = answer.views; viewsLoaded = true; renderViews()
+  } catch (error) {
+    if (viewRequests.current(ticket)) setNotice(`Could not load saved views: ${errorText(error)}`, true)
+  } finally { viewRequests.finish(ticket) }
+}
+async function storeViews(remove = false): Promise<void> {
+  const path = state.path
+  if (!path || !viewsLoaded || viewsSaving) return
+  const id = els.savedView.value || `view-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  const view: SavedView = { id, name: els.viewName.value.trim(), services: showingAll() ? null : state.key === GROUP ? [...state.selectedServices ?? []] : state.service ? [state.service] : [],
+    filter: els.filter.value, search: els.search.value, level: els.level.value as SavedView['level'], window: (els.window.value === 'event' ? 'tail' : els.window.value) as SavedView['window'],
+    group: els.group.checked, json: els.json.checked, wrap: els.wrap.checked, timestamps: els.timestamps.checked }
+  const next = remove ? views.filter((view) => view.id !== id) : views.some((view) => view.id === id) ? views.map((item) => item.id === id ? view : item) : [...views, view]
+  const ticket = viewRequests.begin(true)!
+  viewsSaving = true; renderViews()
+  try {
+    const answer = await orca.plugin.request('views.set', { path, views: next }, { signal: ticket.signal })
+    if (!viewRequests.current(ticket)) return
+    views = answer.views; viewsSaving = false; renderViews()
+    els.savedView.value = remove ? '' : id
+    if (remove) els.viewName.value = ''
+    renderViews()
+    setNotice(remove ? 'Saved view deleted.' : 'View saved for this project.')
+  } catch (error) {
+    if (viewRequests.current(ticket)) setNotice(`Could not save view: ${errorText(error)}`, true)
+  } finally { if (viewRequests.current(ticket)) { viewsSaving = false; renderViews() }; viewRequests.finish(ticket) }
+}
+els.viewName.addEventListener('input', renderViews)
+els.viewSave.addEventListener('click', () => void storeViews())
+els.viewDelete.addEventListener('click', () => void storeViews(true))
+els.savedView.addEventListener('change', () => {
+  const view = views.find((view) => view.id === els.savedView.value)
+  els.viewName.value = view?.name ?? ''
+  renderViews()
+  if (!view) return
+  eventRange = null
+  els.filter.value = view.filter; els.search.value = view.search; els.level.value = view.level; els.window.value = view.window
+  els.group.checked = view.group; els.json.checked = view.json; els.wrap.checked = view.wrap; els.timestamps.checked = view.timestamps
+  selectKey(view.services === null ? ALL : GROUP, null, view.services, false)
+  resetLogs(); renderLog(true); void loadLogs(true)
+})
 
 async function loadComposeOptions(): Promise<void> {
   const path = state.path
@@ -743,7 +993,7 @@ async function applyCompose(event: Event): Promise<void> {
 }
 
 function pickKey(rows: ServiceRow[]): { key: string; service: string | null } | null {
-  if (state.key === ALL && rows.filter((r) => r.containerId).length >= 2) return { key: ALL, service: null }
+  if (state.key === ALL || state.key === GROUP) return { key: state.key, service: null }
   const row =
     rows.find((r) => r.key === state.key) ??
     rows.find((r) => r.service === state.service && r.containerId) ??
@@ -815,20 +1065,25 @@ async function loadStats(): Promise<void> {
   } finally { statRequests.finish(ticket) }
 }
 
-function selectKey(key: string, service: string | null): void {
-  const same = key === state.key
+function selectKey(key: string, service: string | null, services: string[] | null = null, fetch = true): void {
+  const same = key === state.key && JSON.stringify(services) === JSON.stringify(state.selectedServices)
+  eventRange = null
+  if (els.window.value === 'event') els.window.value = 'tail'
+  state.selectedServices = services
   state.key = key
   state.service = service
-  if (state.path) lastSelection.set(state.path, { key, service })
+  if (state.path) lastSelection.set(state.path, { key, service, services })
   renderServices()
+  renderEvents()
   if (same) return
   resetLogs()
   renderLog(true)
-  void loadLogs(true)
+  if (fetch) void loadLogs(true)
 }
 
 /** Where a container's log starts for the chosen period. */
 function sinceFor(row: ServiceRow): string | undefined {
+  if (eventRange) return eventRange.since
   const window = els.window.value
   if (window === 'start') return row.startedAt ?? undefined
   const span = WINDOWS[window]
@@ -836,10 +1091,10 @@ function sinceFor(row: ServiceRow): string | undefined {
 }
 
 function logTargets(): LogTarget[] {
-  const rows = showingAll() ? containers() : [selectedRow()].filter((r): r is ServiceRow => !!r?.containerId)
+  const rows = selectedRows().filter((r) => r.containerId)
   return rows.map((r) => {
     const since = sinceFor(r)
-    return { service: r.service, containerId: r.containerId as string, name: r.name, ...(since ? { since } : {}) }
+    return { service: r.service, containerId: r.containerId as string, name: r.name, ...(since ? { since } : {}), ...(eventRange ? { until: eventRange.until } : {}) }
   })
 }
 
@@ -905,6 +1160,7 @@ async function act(row: ServiceRow, action: ServiceAction): Promise<void> {
     if (revision === pathRevision) { state.busy.delete(row.key); renderServices() }
   }
   if (revision !== pathRevision) return
+  await loadOperations(true)
   await loadServices()
   await loadLogs(true)
 }
@@ -939,6 +1195,7 @@ async function projectAct(action: ProjectAction): Promise<void> {
     if (operation === projectOperation) { state.projectBusy = null; renderProjectActions() }
   }
   if (operation !== projectOperation) return
+  await loadOperations(true)
   await loadServices()
   await loadLogs(true)
 }
@@ -973,6 +1230,7 @@ async function openSource(service: string, link: { file: string; line: number; c
 
 function logSource(): string {
   const row = selectedRow()
+  if (state.key === GROUP) return `services "${state.selectedServices?.join(', ')}" of the compose project "${state.project}"`
   if (showingAll() || !row) return `all services of the compose project "${state.project}"`
   return `container "${row.name}" (service "${row.service}" of the compose project "${state.project}")`
 }
@@ -1040,7 +1298,7 @@ async function saveLog(): Promise<void> {
   if (!shown.length) return
   const data = shown.map(({ line, text }) => `${line.t} ${line.src ? `${line.src} | ` : ''}${text}`).join('\n') + '\n'
   const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '-')
-  const name = showingAll() ? state.project || 'compose' : selectedRow()?.name ?? 'container'
+  const name = showingAll() || state.key === GROUP ? state.project || 'compose' : selectedRow()?.name ?? 'container'
   try {
     await orca.files.saveAs({ suggestedName: `${name}-${stamp}.log`, mimeType: 'text/plain', data })
   } catch (error) {
@@ -1086,7 +1344,7 @@ async function loadPrefs(): Promise<void> {
     }
     for (const [name, select] of Object.entries(selects)) {
       const value = prefs?.[name]
-      if (typeof value === 'string' && [...select.options].some((o) => o.value === value)) select.value = value
+      if (typeof value === 'string' && [...select.options].some((o) => o.value === value && !o.disabled)) select.value = value
     }
   } catch {
     // Defaults from the markup stay.
@@ -1097,7 +1355,7 @@ function savePrefs(): void {
   const prefs = {
     servicesHeight,
     ...Object.fromEntries(Object.entries(checkboxes).map(([name, input]) => [name, input.checked])),
-    ...Object.fromEntries(Object.entries(selects).map(([name, select]) => [name, select.value]))
+    ...Object.fromEntries(Object.entries(selects).map(([name, select]) => [name, select.value === 'event' ? 'tail' : select.value]))
   }
   void orca.storage.set(PREFS_KEY, prefs).catch(() => undefined)
 }
@@ -1123,6 +1381,41 @@ els.resize.addEventListener('pointerdown', (event) => {
   document.addEventListener('pointermove', move)
   document.addEventListener('pointerup', end)
   document.addEventListener('pointercancel', end)
+})
+
+function renderSearchCount(): void {
+  const count = searchNavigation.count
+  els.searchCount.textContent = els.search.value ? `${count ? searchNavigation.index + 1 : 0} / ${count}${searchLimited ? '+' : ''}` : ''
+  els.searchCount.title = searchLimited ? 'First 1000 matches in the loaded log' : 'Matches in the loaded log'
+  els.searchPrevious.disabled = els.searchNext.disabled = count === 0
+  const errors = els.log.querySelectorAll(':scope > .lvl-error').length
+  els.errorPrevious.disabled = els.errorNext.disabled = errors === 0
+}
+function moveSearch(delta: number): void { searchNavigation.move(delta); renderSearchCount() }
+function moveError(delta: number): void {
+  const errors = [...els.log.querySelectorAll<HTMLElement>(':scope > .lvl-error')]
+  if (!errors.length) return
+  const current = errors.indexOf(lastErrorNode!)
+  const index = current < 0 ? delta > 0 ? 0 : errors.length - 1 : (current + delta + errors.length) % errors.length
+  lastErrorNode?.classList.remove('current-error')
+  lastErrorNode = errors[index]
+  lastErrorNode.classList.add('current-error')
+  revealLogNode(lastErrorNode)
+}
+els.search.addEventListener('input', () => renderLog())
+els.search.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') { event.preventDefault(); moveSearch(event.shiftKey ? -1 : 1) }
+  if (event.key === 'Escape') { els.search.value = ''; renderLog(); els.log.focus() }
+})
+els.searchPrevious.addEventListener('click', () => moveSearch(-1))
+els.searchNext.addEventListener('click', () => moveSearch(1))
+els.errorPrevious.addEventListener('click', () => moveError(-1))
+els.errorNext.addEventListener('click', () => moveError(1))
+document.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') { event.preventDefault(); els.search.focus(); els.search.select() }
+  if (event.key === 'F3') { event.preventDefault(); moveSearch(event.shiftKey ? -1 : 1) }
+  const editing = (event.target as HTMLElement)?.closest('input,textarea,select,[contenteditable]')
+  if (!editing && event.altKey && ['ArrowUp', 'ArrowDown'].includes(event.key)) { event.preventDefault(); moveError(event.key === 'ArrowDown' ? 1 : -1) }
 })
 
 // ---------- wiring ----------
@@ -1153,6 +1446,7 @@ els.level.addEventListener('change', () => {
   renderLog(true)
 })
 els.window.addEventListener('change', () => {
+  eventRange = null
   savePrefs()
   resetLogs()
   renderLog(true)
@@ -1169,10 +1463,12 @@ for (const input of Object.values(checkboxes)) {
 setInterval(() => {
   if (!document.hidden && els.follow.checked) void loadLogs()
 }, LOG_POLL_MS)
+setInterval(() => { if (!document.hidden) void loadOperations() }, 2000)
 setInterval(() => {
   if (document.hidden) return
   void loadServices()
   void loadStats()
+  void loadEvents()
 }, SERVICES_POLL_MS)
 
 renderWorkspaces()

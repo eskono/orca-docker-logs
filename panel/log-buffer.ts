@@ -51,12 +51,12 @@ export class LogBuffer {
       this.boundaries.set(id, counts)
       counts.set(key, Math.max(counts.get(key) ?? 0, seen.get(id)?.get(key) ?? 0))
     }
-    const active = new Map(targets.map((t) => [t.containerId, t.since]))
+    const active = new Map(targets.map((t) => [t.containerId, t]))
     this.lines = [...this.lines, ...fresh].sort((a, b) => timeKey(a.t).localeCompare(timeKey(b.t))).filter((line) => {
       if (!line.containerId) return true
       if (!active.has(line.containerId)) return false
-      const since = active.get(line.containerId)
-      return !since || timeKey(line.t) >= timeKey(since)
+      const target = active.get(line.containerId)!
+      return (!target.since || timeKey(line.t) >= timeKey(target.since)) && (!target.until || timeKey(line.t) <= timeKey(target.until))
     })
     let chars = 0
     let start = this.lines.length

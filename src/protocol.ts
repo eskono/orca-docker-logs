@@ -53,8 +53,8 @@ export type ContainerStats = { cpu: string; mem: string; memLimit: string; memPe
  */
 export type LogLine = { t: string; e: boolean; m: string; src?: string; containerId?: string }
 
-/** A container whose log to read, from `since` (RFC 3339) when given. */
-export type LogTarget = { service: string; containerId: string; name: string; since?: string; cursor?: string }
+/** A container whose log to read, optionally bounded by `since` / `until` (RFC 3339). */
+export type LogTarget = { service: string; containerId: string; name: string; since?: string; until?: string; cursor?: string }
 
 export type LogAnswer = {
   lines: LogLine[]
@@ -69,6 +69,34 @@ export type ServiceAction = 'start' | 'stop' | 'restart' | 'build'
 /** `up` opens a terminal (it may build or pull); `restart` and `down` run in the background. */
 export type ProjectAction = 'up' | 'restart' | 'down'
 
+export type Operation = {
+  id: string
+  title: string
+  service: string | null
+  terminalId: string | null
+  status: 'running' | 'succeeded' | 'failed' | 'unknown'
+  startedAt: string
+  finishedAt: string | null
+  exitCode: number | null
+  lines: string[]
+}
+
+export type ContainerEvent = {
+  id: string
+  t: string
+  containerId: string
+  service: string
+  name: string
+  action: string
+  detail: string
+}
+export type EventHistory = { events: ContainerEvent[]; connected: boolean; error: string | null; startedAt: string; limited: boolean }
+export type SavedView = {
+  id: string; name: string; services: string[] | null; filter: string; search: string
+  level: 'all' | 'warn' | 'error'; window: 'tail' | '5m' | '15m' | '1h' | 'start'
+  group: boolean; json: boolean; wrap: boolean; timestamps: boolean
+}
+
 export type Requests = {
   /** Local workspaces that have a compose file, and the focused one when it can be resolved. */
   'workspaces.list': {
@@ -82,6 +110,11 @@ export type Requests = {
   }
   'compose.get': { input: { path: string }; output: { options: ComposeOptions } }
   'compose.set': { input: { path: string; options: ComposeOptions }; output: { options: ComposeOptions } }
+  'operations.list': { input: { path: string }; output: { operations: Operation[] } }
+  'operations.open': { input: { path: string; id: string }; output: { opened: true } }
+  'events.list': { input: { path: string }; output: EventHistory }
+  'views.get': { input: { path: string }; output: { views: SavedView[] } }
+  'views.set': { input: { path: string; views: SavedView[] }; output: { views: SavedView[] } }
   /** CPU and memory of running containers, keyed by container id. Takes a couple of seconds. */
   'stats.get': {
     input: { path: string; containerIds: string[] }

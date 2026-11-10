@@ -62,7 +62,24 @@ try {
   const stats = await worker.request('stats.get', { path: root, containerIds: [app.containerId, db.containerId] })
   assert.ok(stats.stats[app.containerId!])
   await worker.request('compose.set', { path: root, options: { files: ['infra/stack.yml'], profiles: ['tools'] } })
+  await worker.request('events.list', { path: root })
   await worker.request('service.action', { path: root, service: app.service, containerId: app.containerId, action: 'restart' })
+  const operations = await worker.request('operations.list', { path: root })
+  assert.equal(operations.operations[0].status, 'succeeded')
+  let events
+  for (let i = 0; i < 15; i++) {
+    events = await worker.request('events.list', { path: root })
+    if (events.events.some((event: { action: string }) => event.action === 'restart')) break
+    await new Promise((done) => setTimeout(done, 200))
+  }
+  assert.ok(events.events.some((event: { action: string; containerId: string }) => event.action === 'restart' && event.containerId === app.containerId))
+  const restartAt = events.events.find((event: { action: string }) => event.action === 'restart').t
+  const bounded = await worker.request('logs.get', { path: root, targets: [{ ...targets[0], since: new Date(Date.parse(restartAt) - 30_000).toISOString(), until: restartAt }] })
+  assert.ok(bounded.lines.length > 0)
+  assert.ok(bounded.lines.every((line: LogLine) => timeKey(line.t) <= timeKey(restartAt)))
+  const view = { id: 'smoke-view', name: 'App and DB', services: ['app', 'db'], filter: '', search: 'fixture', level: 'error', window: '5m', group: true, json: false, wrap: true, timestamps: true }
+  await worker.request('views.set', { path: root, views: [view] })
+  assert.deepEqual((await worker.request('views.get', { path: root })).views, [view])
   const { clearedAt } = await worker.request('logs.clear', { path: root, services: ['app', 'db'] })
   await new Promise((done) => setTimeout(done, 1200))
   const cleared = await worker.request('logs.get', { path: root, targets })
@@ -76,7 +93,7 @@ try {
   foreignId = (await docker(['run', '-d', '--pull', 'never', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--name', `${project}-foreign`, '--entrypoint', '/bin/sh', image, '-c', 'sleep 120'])).stdout.trim()
   await assert.rejects(worker.request('service.action', { path: root, service: 'app', containerId: foreignId, action: 'stop' }), { code: 'not_permitted' })
   assert.equal((await docker(['inspect', '--format', '{{.State.Running}}', foreignId])).stdout.trim(), 'true')
-  console.log('Live Docker smoke passed: nested COMPOSE_FILE, ownership, profiles, stdout/stderr logs, Clear, cursors, stats, bind-mount source mapping and restart.')
+  console.log('Live Docker smoke passed: nested COMPOSE_FILE, ownership, profiles, stdout/stderr logs, Clear, cursors, stats, bind-mount source mapping, operation completion, event streaming, bounded event logs, saved views and restart.')
 } catch (error) {
   const logs = await docker(['compose', '-p', project, '-f', 'infra/stack.yml', 'logs', '--no-color', '--tail', '10'], root).catch(() => null)
   if (logs) console.error(logs.stdout + logs.stderr)

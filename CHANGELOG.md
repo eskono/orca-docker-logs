@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0
+
+- Search loaded logs without filtering context; highlight matches across ANSI/link spans and navigate with keyboard shortcuts.
+- Show progress, recent output and confirmed exit status for Compose/container actions, with terminal access and persisted history.
+- Collapse multiline stack traces, highlight project frames, dim known library frames and navigate between error records.
+- Record bounded container event timelines across rebuilds and worker reloads; reconnect event streams and jump to logs around an event.
+- Combine any selection of services, including replicas, and save workspace-specific views with filters, periods and display settings.
+- Add the `terminal:read` capability to monitor only terminals created for tracked Docker operations.
+- Cover the new flows with unit, DOM and worker tests plus real Docker integration checks.
+
 ## 0.4.0
 
 - Ignore stale project, service and log responses, including polls completing after Clear.
