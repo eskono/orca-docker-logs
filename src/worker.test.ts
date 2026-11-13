@@ -458,3 +458,26 @@ test('event recording checks workspace ownership and bounded log requests pass u
   await assert.rejects(worker.request('logs.get', { path: project, targets: [{ ...target, until: '2025-01-01T00:00:00Z' }] }), { code: 'invalid_params' })
   await assert.rejects(worker.request('events.list', { path: '/foreign' }), { code: 'not_permitted' })
 })
+
+test('lists projects with only nested configs and previews their profiles without changing saved settings', async (t) => {
+  const { worker, project, plain, args, host } = await setup()
+  t.after(() => worker.deactivate())
+  await mkdir(join(plain, '.docker', 'local'), { recursive: true })
+  await writeFile(join(plain, '.docker', 'local', 'dev.yml'), 'services:\n  app:\n    profiles: [web]\n')
+  const workspaces = await worker.request('workspaces.list', { context: { displayName: 'feature', branch: 'feature', terminals: [] } })
+  assert.ok(workspaces.workspaces.some((workspace: { path: string }) => workspace.path === plain))
+  assert.deepEqual(await worker.request('compose.discover', { path: plain }), { files: ['.docker/local/dev.yml'], truncated: false })
+  await mkdir(join(project, 'docker', 'local'), { recursive: true })
+  await writeFile(join(project, 'docker/local/compose.yaml'), 'services: {}')
+  await writeFile(join(project, 'docker/local/compose.override.yaml'), 'services: {}')
+  const files = ['docker/local/compose.yaml', 'docker/local/compose.override.yaml']
+  assert.deepEqual(await worker.request('compose.profiles', { path: project, files }), { profiles: ['web'] })
+  assert.ok((await args()).includes('compose -f docker/local/compose.yaml -f docker/local/compose.override.yaml config --profiles'))
+  assert.deepEqual(await worker.request('compose.get', { path: project }), { options: { files: [], profiles: [] } })
+  await worker.request('compose.set', { path: project, options: { files, profiles: ['web'] } })
+  await worker.request('project.action', { path: project, action: 'up' })
+  const command = (host.callsOf('terminal.create').at(-1) as { command: string }).command
+  assert.ok(command.includes('compose -f docker/local/compose.yaml -f docker/local/compose.override.yaml --profile web up -d'))
+  await assert.rejects(worker.request('compose.discover', { path: '/foreign' }), { code: 'not_permitted' })
+  await assert.rejects(worker.request('compose.profiles', { path: project, files: ['../inspect.json'] }), { code: 'invalid_params' })
+})

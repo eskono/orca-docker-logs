@@ -44,6 +44,11 @@ try {
     'workspace.list': { workspaces: [{ id: 'smoke', name: 'smoke', path: root, branch: 'main', hostId: 'local' }] }
   } })
   worker = await mountWorker(main, { host })
+  const discovered = await worker.request('compose.discover', { path: root })
+  assert.ok(discovered.files.includes('infra/stack.yml'))
+  const preview = await worker.request('compose.profiles', { path: root, files: ['infra/stack.yml'] })
+  assert.deepEqual(preview.profiles, ['tools'])
+  assert.deepEqual((await worker.request('compose.get', { path: root })).options, { files: [], profiles: [] })
   const model = await worker.request('services.list', { path: root })
   const app = model.rows.find((row: ServiceRow) => row.service === 'app') as ServiceRow
   const db = model.rows.find((row: ServiceRow) => row.service === 'db') as ServiceRow
@@ -93,7 +98,7 @@ try {
   foreignId = (await docker(['run', '-d', '--pull', 'never', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--name', `${project}-foreign`, '--entrypoint', '/bin/sh', image, '-c', 'sleep 120'])).stdout.trim()
   await assert.rejects(worker.request('service.action', { path: root, service: 'app', containerId: foreignId, action: 'stop' }), { code: 'not_permitted' })
   assert.equal((await docker(['inspect', '--format', '{{.State.Running}}', foreignId])).stdout.trim(), 'true')
-  console.log('Live Docker smoke passed: nested COMPOSE_FILE, ownership, profiles, stdout/stderr logs, Clear, cursors, stats, bind-mount source mapping, operation completion, event streaming, bounded event logs, saved views and restart.')
+  console.log('Live Docker smoke passed: nested config discovery, profile preview, COMPOSE_FILE, ownership, profiles, stdout/stderr logs, Clear, cursors, stats, bind-mount source mapping, operation completion, event streaming, bounded event logs, saved views and restart.')
 } catch (error) {
   const logs = await docker(['compose', '-p', project, '-f', 'infra/stack.yml', 'logs', '--no-color', '--tail', '10'], root).catch(() => null)
   if (logs) console.error(logs.stdout + logs.stderr)

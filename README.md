@@ -16,7 +16,11 @@ asks you to approve full access.
   folder, so Compose picks the files the way it does in a terminal (`compose.yaml` /
   `docker-compose.yml`, their `.override`, `COMPOSE_FILE` from `.env`). Services of every
   profile are listed; one that never ran shows its profile and starts with it. **Compose settings**
-  selects custom files (one workspace-relative path per line) and profiles for Up. Settings are
+  lists configs from project folders, including nested paths such as `.docker/local/dev.yml`,
+  and lets you select their profiles for Up before applying the settings. Select the base file
+  first, then any overrides; their order is shown and can be edited in the path field. Projects
+  with only nested configs also appear in the project picker. You can still enter custom paths
+  (one workspace-relative path per line) and profile names manually. Settings are
   checked before saving and belong to that workspace. Custom files keep the workspace's `.env`
   when present, unless `COMPOSE_ENV_FILES` or `COMPOSE_DISABLE_ENV_FILE` overrides dotenv use.
   Build/bind paths still resolve from the first Compose file. Empty fields restore Compose defaults.
@@ -107,6 +111,11 @@ Event history retains up to 200 events / 48 KB per target. Operation history kee
 operations / 48 KB per workspace, with at most four concurrent commands and a bounded output
 tail. Saved views are limited to 20 / 48 KB per workspace. These histories use plugin-owned storage.
 
+Config discovery recognizes standard Compose filenames and YAML files with top-level `services`
+or `include` keys. It skips dependency/metadata folders and symlinks, and scans up to 20,000
+entries / 1000 directories, returning at most 200 configs. **Rescan folders** refreshes the list;
+paths can also be entered manually if a scan reaches its limit or a custom file is not recognized.
+
 ## Settings
 
 | Setting                       | Default  | What it does                                               |
@@ -142,6 +151,7 @@ tail. Saved views are limited to 20 / 48 KB per workspace. These histories use p
 | `src/docker.ts`      | Finds and runs docker; parses `compose config`, `inspect`, `stats`, logs   |
 | `src/status.ts`      | Status bar summary and which container problems notify                     |
 | `src/compose.ts`     | Compose command arguments and validation of workspace configuration        |
+| `src/compose-discovery.ts` | Bounded discovery of Compose configs in project folders               |
 | `src/diagnostics.ts` | Container diagnostics shared by the panel and agent hand-off               |
 | `src/operations.ts`  | Tracked command output, exit status and persisted operation history         |
 | `src/events.ts`      | Bounded Docker event streams, reconnects and persisted timelines            |

@@ -109,6 +109,8 @@ export type Requests = {
     output: { project: string; rows: ServiceRow[]; context: DockerContext; options: ComposeOptions; profiles: string[] }
   }
   'compose.get': { input: { path: string }; output: { options: ComposeOptions } }
+  'compose.discover': { input: { path: string }; output: { files: string[]; truncated: boolean } }
+  'compose.profiles': { input: { path: string; files: string[] }; output: { profiles: string[] } }
   'compose.set': { input: { path: string; options: ComposeOptions }; output: { options: ComposeOptions } }
   'operations.list': { input: { path: string }; output: { operations: Operation[] } }
   'operations.open': { input: { path: string; id: string }; output: { opened: true } }

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0
+
+- Discover Compose configs in nested project folders, including `.docker` and custom YAML filenames.
+- List projects whose configs live only in nested folders.
+- Select ordered base/override files and preview/select their Compose profiles before applying settings.
+- Preserve manual paths, workspace-specific settings, dotenv behavior and Compose's relative path resolution.
+- Cover nested discovery, profile previews, selection races and ordered launch commands with regression tests and a real Docker check.
+
 ## 0.5.0
 
 - Search loaded logs without filtering context; highlight matches across ANSI/link spans and navigate with keyboard shortcuts.

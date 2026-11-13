@@ -55,6 +55,8 @@ async function panel(override: Override = () => undefined) {
           case 'views.get': return { views: [] }
           case 'views.set': return { views: input.views }
           case 'compose.get': return { options: { files: [], profiles: [] } }
+          case 'compose.discover': return { files: [], truncated: false }
+          case 'compose.profiles': return { profiles: ['web'] }
           case 'services.list': return { project: input.path, rows: [row(input.path)], options: { files: [], profiles: [] }, profiles: ['web'], context: { name: 'default', endpoint: 'unix:///var/run/docker.sock', remote: false } }
           case 'stats.get': return { stats: {} }
           case 'logs.get': return answer([line(`INFO ${input.path}`, 1, input.path)])
@@ -302,4 +304,60 @@ test('delayed saved-view responses cannot replace a newly selected workspace', a
   pending[0].resolve({ views: [{ id: 'old', name: 'Old view' }] }); pending[1].resolve({ views: [{ id: 'wrong', name: 'Other project' }] }); await settle()
   assert.equal(ui.element<HTMLSelectElement>('saved-view').options.length, 1)
   assert.equal(ui.element<HTMLSelectElement>('workspace').value, A.path)
+})
+
+test('selects nested Compose configs and their profiles, preserves file order and applies them together', async (t) => {
+  let options = { files: [] as string[], profiles: [] as string[] }
+  const ui = await panel((name, input) => {
+    if (name === 'compose.discover') return { files: ['.docker/local/dev.yml', '.docker/local/override.yml'], truncated: false }
+    if (name === 'compose.profiles') return { profiles: input.files.length ? ['web', 'tools'] : [] }
+    if (name === 'compose.get') return { options }
+    if (name === 'compose.set') { options = input.options; return { options } }
+  })
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  const select = (label: string) => {
+    const check = ui.window.document.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!
+    assert.ok(check)
+    check.checked = true; check.dispatchEvent(new ui.window.Event('change'))
+  }
+  select('Use Compose config .docker/local/dev.yml'); await settle()
+  select('Use Compose config .docker/local/override.yml'); await settle()
+  select('Enable Compose profile tools')
+  assert.equal(ui.element<HTMLTextAreaElement>('compose-files').value, '.docker/local/dev.yml\n.docker/local/override.yml')
+  assert.equal(ui.element<HTMLInputElement>('compose-profiles').value, 'tools')
+  assert.equal(ui.requests.filter((request) => request.name === 'compose.set').length, 0)
+  ui.element<HTMLFormElement>('compose-form').dispatchEvent(new ui.window.Event('submit', { cancelable: true })); await settle()
+  assert.deepEqual(options, { files: ['.docker/local/dev.yml', '.docker/local/override.yml'], profiles: ['tools'] })
+  assert.equal(ui.window.document.querySelector<HTMLInputElement>('[aria-label="Enable Compose profile tools"]')!.checked, true)
+})
+
+test('stale profile previews cannot replace profiles for a newer file selection', async (t) => {
+  const pending: ReturnType<typeof deferred>[] = []
+  const ui = await panel((name) => {
+    if (name === 'compose.profiles') { const wait = deferred(); pending.push(wait); return wait.promise }
+  })
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  const files = ui.element<HTMLTextAreaElement>('compose-files')
+  files.value = 'docker/dev.yml'; files.dispatchEvent(new ui.window.Event('change')); await settle()
+  files.value = 'docker/prod.yml'; files.dispatchEvent(new ui.window.Event('change')); await settle()
+  pending[2].resolve({ profiles: ['production'] }); await settle()
+  pending[1].resolve({ profiles: ['development'] }); pending[0].resolve({ profiles: ['base'] }); await settle()
+  assert.match(ui.element('compose-profile-choices').textContent!, /production/)
+  assert.doesNotMatch(ui.element('compose-profile-choices').textContent!, /development|base/)
+})
+
+test('late saved Compose settings do not overwrite a config picked by the user', async (t) => {
+  const saved = deferred()
+  const ui = await panel((name) => {
+    if (name === 'compose.get') return saved.promise
+    if (name === 'compose.discover') return { files: ['docker/dev.yml'], truncated: false }
+  })
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  const check = ui.window.document.querySelector<HTMLInputElement>('[aria-label="Use Compose config docker/dev.yml"]')!
+  check.checked = true; check.dispatchEvent(new ui.window.Event('change')); await settle()
+  saved.resolve({ options: { files: ['compose.yaml'], profiles: [] } }); await settle()
+  assert.equal(ui.element<HTMLTextAreaElement>('compose-files').value, 'docker/dev.yml')
 })

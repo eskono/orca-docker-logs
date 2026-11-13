@@ -5,6 +5,8 @@ import { isAbsolute, relative, resolve, sep } from 'node:path'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { buildRows, byTime, containerLines, fail, findDocker, lines, newestWithin, parseConfig, parseInspect, parseStats, run, shellQuote, type Container, type ComposeConfig } from './docker'
 import { composeArgs, composeEnvFile, defaultOptions, validateOptions } from './compose'
+import { discoverComposeFiles } from './compose-discovery'
+import { createLimiter } from './async'
 import { diagnosticSummary } from './diagnostics'
 import { latestTime, timeKey } from './log-time'
 import type { ComposeOptions, DockerContext, FocusContext, LogAnswer, LogLine, ProjectAction, Requests, ServiceAction, ServiceRow, Workspace } from './protocol'
@@ -94,6 +96,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   let cachedWorkspaces: { at: number; list: Workspace[] } | null = null
   type ConfigEntry = { at: number; config: ComposeConfig; profiles: string[]; options: ComposeOptions; envFile?: string }
   const configCache = new Map<string, ConfigEntry>()
+  const scan = createLimiter(4)
 
   async function localWorkspaces(fresh = false): Promise<Workspace[]> {
     if (!fresh && cachedWorkspaces && Date.now() - cachedWorkspaces.at < 10_000) return cachedWorkspaces.list
@@ -202,14 +205,25 @@ export default function activate(orca: OrcaWorkerApi): void {
   }
 
   const handlers: { [K in keyof Requests]: Handler<K> } = {
-    'workspaces.list': async ({ context }) => {
+    'workspaces.list': async ({ context }, signal) => {
       const all = await localWorkspaces(true)
-      const flags = await Promise.all(all.map(async (w) => (await optionsFor(w.path)).files.length > 0 || await hasComposeFile(w.path)))
+      const flags = await Promise.all(all.map((w) => scan(async () => (await optionsFor(w.path)).files.length > 0 || await hasComposeFile(w.path) || (await discoverComposeFiles(w.path, 1, signal)).files.length > 0, signal)))
       const focused = await resolveFocused(context, all)
       // The focused folder remains selectable so a custom Compose file can be configured there.
       return { workspaces: all.filter((w, i) => flags[i] || w.path === focused?.path), focused }
     },
     'compose.get': async (input) => ({ options: await optionsFor((await workspaceFor(input.path)).path) }),
+    'compose.discover': async (input, signal) => {
+      const { path } = await workspaceFor(input.path)
+      return scan(() => discoverComposeFiles(path, 200, signal), signal)
+    },
+    'compose.profiles': async (input, signal) => {
+      const { path } = await workspaceFor(input.path)
+      const options = await validateOptions(path, { files: input.files, profiles: [] })
+      const envFile = await composeEnvFile(path, options)
+      const result = await run(await docker(), [...composeArgs(options, [], envFile), 'config', '--profiles'], { cwd: path, timeoutMs: 20_000, signal })
+      return { profiles: lines(result.stdout) }
+    },
     'compose.set': async (input, signal) => {
       const { path } = await workspaceFor(input.path)
       const options = await validateOptions(path, input.options)
