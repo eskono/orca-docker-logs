@@ -26,6 +26,19 @@ test('keeps only workspaces on this machine', () => {
   assert.deepEqual(localOnly(listed).map((w) => w.id), ['1', '2'])
 })
 
+test('workspace order follows project folders regardless of host order or shared branch names', () => {
+  const listed = [
+    { ...ws('a', 'main', '/repos/zeta', 'main'), hostId: 'local' },
+    { ...ws('b', 'main', '/repos/alpha', 'main'), hostId: null },
+    { ...ws('c', 'main', '/other/alpha', 'main'), hostId: 'local' },
+    { ...ws('d', 'main', '/remote/first', 'main'), hostId: 'ssh:box' }
+  ]
+  const expected = ['/other/alpha', '/repos/alpha', '/repos/zeta']
+  assert.deepEqual(localOnly(listed).map((w) => w.path), expected)
+  assert.deepEqual(localOnly([...listed].reverse()).map((w) => w.path), expected)
+  assert.equal(listed[0].id, 'a')
+})
+
 test('a unique name and branch is enough', async () => {
   const context = { displayName: 'feature-x', branch: 'refs/heads/feature-x', terminals: [] }
   assert.equal((await resolveFocused(context, all, noTerminals))?.path, '/repos/api-feature')

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.1
+
+- Keep every local Orca workspace selectable regardless of focus or Compose discovery results.
+- Sort project choices by folder with stable path tie-breakers, so host ordering cannot reshuffle the picker.
+- Avoid scanning every project's files when refreshing the project list; discover configs within the selected workspace.
+- Add regression coverage for focus changes and reversed workspace ordering.
+
 ## 0.8.0
 
 - Detect existing Compose stacks from verified working-directory and config-file labels, including nested configs and custom project names.

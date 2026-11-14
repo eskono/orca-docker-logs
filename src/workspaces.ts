@@ -1,6 +1,6 @@
-// Which local workspaces have compose files, and which one is focused in Orca.
+// Stable local workspace choices, root Compose detection and Orca's focused workspace.
 import { readFile, readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { terminalPaths } from './orca-cli'
 import type { FocusContext, Workspace } from './protocol'
 
@@ -19,6 +19,7 @@ export function localOnly(workspaces: ListedWorkspace[]): Workspace[] {
   return workspaces
     .filter((w) => w.hostId === null || w.hostId === 'local')
     .map(({ id, name, path, branch }) => ({ id, name, path, branch }))
+    .sort((a, b) => basename(a.path).localeCompare(basename(b.path)) || a.path.localeCompare(b.path) || a.id.localeCompare(b.id))
 }
 
 export async function hasComposeFile(path: string): Promise<boolean> {

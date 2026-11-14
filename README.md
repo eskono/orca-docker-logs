@@ -54,9 +54,9 @@ asks you to approve full access.
 - **Diagnostics.** Expand the selected container's diagnostics to see its exit code, OOM-kill
   flag, restart count, runtime error, last health check and start/finish times. The Docker context
   is shown above the services, with the endpoint in its tooltip and a label for remote daemons.
-- **The project follows Orca's focus.** The picker at the top lists every local workspace with a
-  compose file or saved configuration, to look at another one. The focused local workspace is
-  also listed when it has no automatically discovered file, so custom files can be configured.
+- **The project follows Orca's focus.** The picker at the top lists every local workspace in
+  alphabetical folder order. Its contents stay the same when focus moves or Compose files
+  change; workspaces without discovered files remain available for configuring custom files.
   Drag the divider below the services, or focus it and use the arrow keys, to resize the list.
 - **Actions.** Per container: shell (`docker exec -it … bash`, or `sh`), rebuild
   (`compose up -d --build`), restart, stop, start. For the project: Up, Restart and Down (Down

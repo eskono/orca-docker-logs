@@ -288,12 +288,11 @@ export default function activate(orca: OrcaWorkerApi): void {
   }
 
   const handlers: { [K in keyof Requests]: Handler<K> } = {
-    'workspaces.list': async ({ context }, signal) => {
+    'workspaces.list': async ({ context }) => {
       const all = await localWorkspaces(true)
-      const flags = await Promise.all(all.map((w) => scan(async () => (await optionsFor(w.path)).files.length > 0 || await hasComposeFile(w.path) || (await discoverComposeFiles(w.path, 1, signal)).files.length > 0, signal)))
       const focused = await resolveFocused(context, all)
-      // The focused folder remains selectable so a custom Compose file can be configured there.
-      return { workspaces: all.filter((w, i) => flags[i] || w.path === focused?.path), focused }
+      // Configuration discovery belongs to the selected workspace, not picker membership.
+      return { workspaces: all, focused }
     },
     'compose.get': async (input) => ({ options: await optionsFor((await workspaceFor(input.path)).path) }),
     'compose.discover': async (input, signal) => {

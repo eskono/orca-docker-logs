@@ -138,10 +138,10 @@ process.stdout.write(JSON.stringify(config));
   return { worker, host, root, project, plain, docker, calls, args, orcaCalls }
 }
 
-test('lists compose workspaces and resolves the focused one', async () => {
+test('lists local workspaces in a stable order and resolves the focused one', async () => {
   const { worker, project, plain } = await setup()
   const answer = await worker.request('workspaces.list', { context: { displayName: 'main', branch: 'main', terminals: [] } })
-  assert.deepEqual(answer.workspaces.map((w: { path: string }) => w.path), [project, plain])
+  assert.deepEqual(answer.workspaces.map((w: { path: string }) => w.path), [plain, project])
   assert.equal(answer.focused?.path, plain)
   await worker.deactivate()
 })
@@ -627,4 +627,22 @@ test('a saved root configuration is not replaced by a detected nested stack and 
   await worker.request('stacks.select', { path: plain, id: detected.stacks[0].id })
   assert.equal((await worker.request('services.list', { path: plain })).detected, true)
   assert.deepEqual((await worker.request('compose.get', { path: plain })).options.files, ['compose.yaml'])
+})
+
+test('project-list membership and order do not change when focus moves to a workspace without Compose', async (t) => {
+  const { worker, project, plain } = await setup()
+  t.after(() => worker.deactivate())
+  const contexts = [null, { displayName: 'main', branch: 'main', terminals: [] }, { displayName: 'feature', branch: 'feature', terminals: [] }, null]
+  const snapshots: string[][] = []
+  for (const context of contexts) snapshots.push((await worker.request('workspaces.list', { context })).workspaces.map((workspace: { path: string }) => workspace.path))
+  assert.deepEqual(snapshots[1], snapshots[0])
+  assert.deepEqual(snapshots[2], snapshots[0])
+  assert.deepEqual(snapshots[3], snapshots[0])
+  assert.equal(snapshots[0].includes(project), true)
+  assert.equal(snapshots[0].includes(plain), true)
+  await unlink(join(project, 'compose.yaml'))
+  await mkdir(join(plain, 'deploy'))
+  await writeFile(join(plain, 'deploy/compose.yaml'), 'services: {}')
+  const afterConfigChanges = await worker.request('workspaces.list', { context: null })
+  assert.deepEqual(afterConfigChanges.workspaces.map((workspace: { path: string }) => workspace.path), snapshots[0])
 })

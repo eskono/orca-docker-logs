@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "docker-logs",
   "name": "Docker Logs",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Docker Compose in Orca: combined live logs, saved views, context-preserving search, collapsible stack traces, operation progress, container events, diagnostics and Ask agent.",
   "author": {
     "name": "Maksim Shevchuk"
