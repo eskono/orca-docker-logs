@@ -4,6 +4,7 @@ import type {
   ContainerStats,
   ComposeOptions,
   ComposeRuntime,
+  DetectedStack,
   DockerContext,
   FocusContext,
   LogLine,
@@ -91,6 +92,10 @@ const els = {
   composeEnvFiles: $<HTMLDataListElement>('compose-env-files'),
   composeProfileMode: $<HTMLSelectElement>('compose-profile-mode'),
   composeRuntime: $<HTMLDivElement>('compose-runtime'),
+  composeProjectName: $<HTMLInputElement>('compose-project-name'),
+  runningStack: $<HTMLSelectElement>('running-stack'),
+  runningStackLabel: $<HTMLLabelElement>('running-stack-label'),
+  detectionNote: $<HTMLDivElement>('detection-note'),
   composeApply: $<HTMLButtonElement>('compose-apply'),
   composeDiscovered: $<HTMLDivElement>('compose-discovered'),
   composeDiscoveryStatus: $<HTMLSpanElement>('compose-discovery-status'),
@@ -149,6 +154,7 @@ const state = {
   dockerContext: { name: 'unknown', endpoint: '', remote: false } as DockerContext,
   options: { files: [], profiles: [] } as ComposeOptions,
   runtime: null as ComposeRuntime | null,
+  detected: false,
   logWarnings: [] as string[],
   limits: [] as string[],
   operations: [] as Operation[],
@@ -170,6 +176,8 @@ let discoveredFiles: string[] = []
 let previewProfiles: string[] = []
 let composeEdited = false
 let previewRuntime: ComposeRuntime | null = null
+let detectedOptions = false
+let stackSwitch = 0
 const operationRequests = new RequestGate()
 const eventRequests = new RequestGate()
 const viewRequests = new RequestGate()
@@ -316,7 +324,7 @@ function renderWorkspaces(): void {
 }
 
 function renderProjectActions(): void {
-  const idle = !!state.path && state.runtime?.enabledServices.length !== 0 && state.servicesLoaded && !state.projectBusy && !state.operations.some((operation) => operation.status === 'running')
+  const idle = !!state.path && !state.detected && state.runtime?.enabledServices.length !== 0 && state.servicesLoaded && !state.projectBusy && !state.operations.some((operation) => operation.status === 'running')
   els.up.disabled = !idle
   els.restart.disabled = !idle || containers().length === 0
   els.down.disabled = !idle || containers().length === 0
@@ -331,7 +339,7 @@ function renderProjectActions(): void {
 
 function rowActions(row: ServiceRow): [IconName, string, () => void][] {
   const label = row.name
-  const build: [IconName, string, () => void][] = row.build ? [['build', `Rebuild ${row.service} (in a terminal)`, () => void act(row, 'build')]] : []
+  const build: [IconName, string, () => void][] = row.build && !state.detected ? [['build', `Rebuild ${row.service} (in a terminal)`, () => void act(row, 'build')]] : []
   if (['running', 'restarting', 'paused'].includes(row.state)) {
     return [
       ...(row.state === 'running' ? [['shell', `Open a shell in ${label}`, () => void openShell(row)] as [IconName, string, () => void]] : []),
@@ -341,7 +349,7 @@ function rowActions(row: ServiceRow): [IconName, string, () => void][] {
     ]
   }
   const start = row.containerId ? `Start ${label}` : `Create and start ${row.service} (in a terminal)`
-  return [...build, ['play', start, () => void act(row, 'start')]]
+  return [...build, ...(!row.containerId && state.detected ? [] : [['play', start, () => void act(row, 'start')] as [IconName, string, () => void]])]
 }
 
 function renderAllRow(): HTMLLIElement | null {
@@ -795,6 +803,12 @@ function setPath(path: string | null): void {
   state.servicesLoaded = false
   state.options = { files: [], profiles: [] }
   state.runtime = null
+  state.detected = false
+  detectedOptions = false
+  stackSwitch++
+  els.runningStackLabel.hidden = true
+  els.runningStack.replaceChildren()
+  els.detectionNote.hidden = true
   els.composeRuntime.textContent = ''
   state.dockerContext = { name: 'loading…', endpoint: '', remote: false }
   const last = path ? lastSelection.get(path) : undefined
@@ -825,6 +839,7 @@ function setPath(path: string | null): void {
   els.composeFiles.value = ''
   els.composeProfiles.value = ''
   els.composeEnvFile.value = ''
+  els.composeProjectName.value = ''
   els.composeEnvFiles.replaceChildren()
   els.composeProfileMode.value = 'auto'
   previewRuntime = null
@@ -1009,7 +1024,7 @@ function runtimeText(runtime: ComposeRuntime, running = false): string {
     `Enabled services: ${names(runtime.enabledServices)}`
   ]
   if (running) {
-    return [`Project command profiles (${runtime.profileSource}): ${names(runtime.effectiveProfiles)}`, `Running services: ${names(runtime.runningServices)}`, ...(runtime.outsideSelection.length ? [`Running outside selection: ${names(runtime.outsideSelection)}`] : [])].join('\n')
+    return [`Project command profiles (${runtime.profileSource}): ${names(runtime.effectiveProfiles)}`, `Running services: ${names(runtime.runningServices)}`, ...(runtime.runningProfiles?.length ? [`Profiles with running services: ${runtime.runningProfiles.map((profile) => `${profile.name} (${profile.services.join(', ')})`).join('; ')}`] : []), ...(runtime.outsideSelection.length ? [`Running outside selection: ${names(runtime.outsideSelection)}`] : [])].join('\n')
   }
   return text.join('\n')
 }
@@ -1018,7 +1033,7 @@ function composeDraft(): ComposeOptions {
   const manual = els.composeProfileMode.value === 'manual'
   const profiles = manual ? composeProfiles() : []
   return { files: composeFiles(), profiles, ...(els.composeEnvFile.value.trim() ? { envFile: els.composeEnvFile.value.trim() } : {}),
-    ...(manual && !profiles.length ? { profileMode: 'manual' as const } : {}) }
+    ...(manual && !profiles.length ? { profileMode: 'manual' as const } : {}), ...(els.composeProjectName.value.trim() ? { projectName: els.composeProjectName.value.trim() } : {}) }
 }
 
 function renderComposeProfiles(): void {
@@ -1086,6 +1101,50 @@ function editComposeFiles(): void {
   void loadComposeProfiles()
 }
 
+function sameComposeOptions(a: ComposeOptions, b: ComposeOptions): boolean {
+  const key = (options: ComposeOptions) => {
+    const mode = options.profileMode ?? (options.profiles.length ? 'manual' : 'auto')
+    return JSON.stringify([options.files, options.envFile ?? '', options.projectName ?? '', mode, mode === 'manual' ? options.profiles : []])
+  }
+  return key(a) === key(b)
+}
+
+function fillComposeOptions(options: ComposeOptions): void {
+  els.composeFiles.value = options.files.join('\n')
+  els.composeProfiles.value = options.profiles.join(', ')
+  els.composeEnvFile.value = options.envFile ?? ''
+  els.composeProjectName.value = options.projectName ?? ''
+  els.composeProfileMode.value = options.profileMode ?? (options.profiles.length ? 'manual' : 'auto')
+  renderComposeFiles()
+}
+
+function renderRunningStacks(stacks: DetectedStack[], project: string, options: ComposeOptions, detected: boolean): void {
+  els.runningStackLabel.hidden = stacks.length === 0
+  const automatic = el('option', undefined, 'Automatic (configured or detected stack)')
+  automatic.value = ''
+  const choices = stacks.map((stack) => {
+    const option = el('option', undefined, `${stack.project} · ${stack.running}/${stack.containers} running · ${stack.files.join(', ')}`)
+    option.value = stack.id
+    return option
+  })
+  els.runningStack.replaceChildren(automatic, ...choices)
+  const current = detected ? stacks.find((stack) => stack.project === project && JSON.stringify(stack.files) === JSON.stringify(options.files) && (stack.envFile ?? '') === (options.envFile ?? '')) : undefined
+  els.runningStack.value = current?.id ?? ''
+  els.runningStack.disabled = false
+}
+
+els.runningStack.addEventListener('change', () => {
+  const path = state.path
+  if (!path) return
+  const operation = ++stackSwitch
+  els.runningStack.disabled = true
+  void orca.plugin.request('stacks.select', { path, id: els.runningStack.value || null }).then(() => {
+    if (operation === stackSwitch && path === state.path) setPath(path)
+  }).catch((error) => {
+    if (operation === stackSwitch && path === state.path) { els.runningStack.disabled = false; setNotice(errorText(error), true) }
+  })
+})
+
 async function loadComposeOptions(): Promise<void> {
   const path = state.path
   if (!path) return
@@ -1095,12 +1154,8 @@ async function loadComposeOptions(): Promise<void> {
     if (!configRequests.current(ticket)) return
     state.options = options
     // Discovery and manual editing can finish before saved settings arrive.
-    if (!composeEdited) {
-      els.composeFiles.value = options.files.join('\n')
-      els.composeProfiles.value = options.profiles.join(', ')
-      els.composeEnvFile.value = options.envFile ?? ''
-      els.composeProfileMode.value = options.profileMode ?? (options.profiles.length ? 'manual' : 'auto')
-      renderComposeFiles()
+    if (!composeEdited && !detectedOptions) {
+      fillComposeOptions(options)
       void loadComposeProfiles()
     }
   } catch (error) {
@@ -1152,8 +1207,18 @@ async function loadServices(fresh = false): Promise<void> {
     const contextChanged = state.dockerContext.name !== answer.context.name || state.dockerContext.endpoint !== answer.context.endpoint
     state.project = answer.project
     state.runtime = answer.runtime ?? null
+    state.detected = answer.detected === true
+    renderRunningStacks(answer.stacks ?? [], answer.project, answer.options, state.detected)
+    els.detectionNote.hidden = !answer.detectionNote
+    els.detectionNote.textContent = answer.detectionNote ?? ''
+    if (state.detected && !composeEdited) {
+      const firstDetection = !detectedOptions
+      detectedOptions = true
+      fillComposeOptions(answer.options)
+      if (firstDetection) els.compose.open = false
+    }
     if (answer.runtime) els.composeRuntime.textContent = runtimeText(answer.runtime, true)
-    if (answer.runtime && !composeEdited && JSON.stringify(composeDraft()) === JSON.stringify(answer.options)) {
+    if (answer.runtime && !composeEdited && sameComposeOptions(composeDraft(), answer.options)) {
       profileRequests.invalidate()
       previewRuntime = answer.runtime
       previewProfiles = answer.profiles
@@ -1577,8 +1642,10 @@ els.composeProfiles.addEventListener('input', () => { composeEdited = true; els.
 els.composeProfiles.addEventListener('change', () => void loadComposeProfiles())
 els.composeEnvFile.addEventListener('input', () => { composeEdited = true; profileRequests.invalidate(); previewRuntime = null; renderComposeProfiles(); els.composeProfileStatus.textContent = 'Finish editing to read profiles.' })
 els.composeEnvFile.addEventListener('change', editComposeFiles)
+els.composeProjectName.addEventListener('input', () => { composeEdited = true; profileRequests.invalidate() })
+els.composeProjectName.addEventListener('change', editComposeFiles)
 els.composeProfileMode.addEventListener('change', () => { composeEdited = true; if (els.composeProfileMode.value === 'auto') els.composeProfiles.value = ''; renderComposeProfiles(); void loadComposeProfiles() })
-$('compose-defaults').addEventListener('click', () => { els.composeFiles.value = ''; els.composeProfiles.value = ''; els.composeEnvFile.value = ''; els.composeProfileMode.value = 'auto'; els.composeForm.requestSubmit() })
+$('compose-defaults').addEventListener('click', () => { els.composeFiles.value = ''; els.composeProfiles.value = ''; els.composeEnvFile.value = ''; els.composeProjectName.value = ''; els.composeProfileMode.value = 'auto'; els.composeForm.requestSubmit() })
 els.ask.prepend(icon('agent'))
 els.workspace.addEventListener('change', () => setPath(els.workspace.value || null))
 els.refresh.addEventListener('click', () => {

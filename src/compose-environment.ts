@@ -43,13 +43,13 @@ export async function composeEnvironment(path: string, bin: string, options: Com
     let files = options.files
     let inherited: Record<string, string> | undefined
     if (!files.length) {
-      const initial = await read([...composeArgs({ files: [], profiles: [] }, [], envFile), '--project-directory', path, '-f', probe])
+      const initial = await read([...composeArgs({ ...options, files: [], profiles: [] }, [], envFile), '--project-directory', path, '-f', probe])
       files = initial.COMPOSE_FILE ? initial.COMPOSE_FILE.split(initial.COMPOSE_PATH_SEPARATOR || delimiter).filter(Boolean).map((file) => isAbsolute(file) ? file : resolve(path, file)) : await defaultFiles(path)
       // Native automatic discovery can load a project-directory .env below the working .env.
       // Preserve the first file's resolved values as the higher-precedence layer in the probe.
       if (!envFile) inherited = initial
     }
-    const values = await read([...composeArgs({ files, profiles: [] }, [], envFile), '-f', probe], inherited)
+    const values = await read([...composeArgs({ ...options, files, profiles: [] }, [], envFile), '-f', probe], inherited)
     return { profiles: [...new Set((values.COMPOSE_PROFILES ?? '').split(',').map((s) => s.trim()).filter(Boolean))], files }
   } finally { await rm(temporary, { recursive: true, force: true }) }
 }

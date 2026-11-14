@@ -35,6 +35,17 @@ asks you to approve full access.
   Up, Restart and Down use the same profile set, env file and project name. Terminal actions
   preserve the worker's Compose control variables even when a terminal has different exports.
   Explicit per-container actions still target the container/service you clicked.
+- **Detect existing stacks.** The panel matches Docker Compose working-directory and config-file
+  labels to files inside the selected workspace. An unconfigured project can immediately show
+  its existing containers and logs, including nested configs and stacks started with a custom
+  project name. A picker switches between detected stacks. Saved settings and a working root
+  configuration keep priority.
+  Profile memberships are matched from the loaded running services to their config, including
+  every membership when a service belongs to several profiles. The original launch flags are
+  not inferred. Detected settings are a draft: Apply them before Compose Up/Down or rebuilding;
+  reading logs and explicit actions on verified existing containers work immediately. If config
+  variables cannot resolve, container state still appears and literal profile memberships are
+  read without interpolation. Detection never saves settings automatically.
 - **State at a glance.** A dot per container (running, starting, unhealthy, crashed), uptime,
   CPU and memory from `docker stats` with a small chart of the last minutes (line: CPU, dashes:
   memory). Click a published port to copy its address; the adjacent arrow opens recognized web
@@ -131,6 +142,9 @@ on Compose 2.17; temporary interpolation probes contain references, not resolved
 values, and are removed after use. Application environment values are not included in profile
 metadata sent to the panel. Root configs, their automatic overrides and root `.env` keep the
 existing discovery behavior; selecting a nested file does not merge root overrides into it.
+Stack detection reads metadata for at most 2000 Compose containers, returning up to 50 matching
+stacks. It verifies working directories and config paths, including symlinks, before associating
+them with a workspace. Container inspection and actions remain scoped to the selected project.
 
 ## Settings
 
@@ -169,6 +183,7 @@ existing discovery behavior; selecting a nested file does not merge root overrid
 | `src/compose.ts`     | Compose command arguments and validation of workspace configuration        |
 | `src/compose-discovery.ts` | Bounded discovery of Compose configs in project folders               |
 | `src/compose-environment.ts` | Compose-resolved environment/profile metadata across supported CLI versions |
+| `src/running-stacks.ts` | Workspace/config matching for existing stacks and running-service profile memberships |
 | `src/diagnostics.ts` | Container diagnostics shared by the panel and agent hand-off               |
 | `src/operations.ts`  | Tracked command output, exit status and persisted operation history         |
 | `src/events.ts`      | Bounded Docker event streams, reconnects and persisted timelines            |

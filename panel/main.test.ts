@@ -423,3 +423,28 @@ test('refreshes inherited profile checkboxes after dotenv changes while preservi
   assert.equal(manual.value, 'dev')
   assert.equal(ui.window.document.querySelector<HTMLInputElement>('[aria-label="Enable Compose profile dev"]')!.checked, true)
 })
+
+test('detected containers and associated profiles appear before saved settings, without silently applying a configuration', async (t) => {
+  const pending = deferred()
+  const options = { files: ['deploy/compose.yaml'], profiles: ['dev', 'shared'], projectName: 'running_project' }
+  let applied: any = null
+  const ui = await panel((name, input) => {
+    if (name === 'compose.get') return applied ? { options: applied } : pending.promise
+    if (name === 'compose.set') { applied = input.options; return { options: applied } }
+    if (name === 'services.list') return { project: 'running_project', rows: [row(A.path, { profiles: ['dev', 'shared'] })], options, profiles: ['dev', 'shared'], detected: !applied, detectionNote: applied ? null : 'Detected from existing containers. Review settings and Apply.', stacks: [{ id: 'stack-one', project: 'running_project', files: options.files, containers: 1, running: 1 }], runtime: { environmentProfiles: [], effectiveProfiles: options.profiles, profileSource: 'selection', envFile: null, enabledServices: ['app'], runningServices: ['app'], outsideSelection: [], runningProfiles: [{ name: 'dev', services: ['app'] }, { name: 'shared', services: ['app'] }] }, context: { name: 'default', endpoint: '', remote: false } }
+  })
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  assert.match(ui.element('log').textContent!, /INFO/)
+  assert.match(ui.element('compose-runtime').textContent!, /dev \(app\).*shared \(app\)/)
+  assert.equal(ui.element<HTMLButtonElement>('project-up').disabled, true)
+  assert.equal(ui.element<HTMLInputElement>('compose-project-name').value, 'running_project')
+  assert.equal(ui.element<HTMLSelectElement>('running-stack').value, 'stack-one')
+  assert.equal(ui.window.document.querySelector<HTMLInputElement>('[aria-label="Enable Compose profile shared"]')!.checked, true)
+  assert.equal(ui.requests.filter((request) => request.name === 'compose.set').length, 0)
+  pending.resolve({ options: { files: [], profiles: [] } }); await settle()
+  assert.equal(ui.element<HTMLTextAreaElement>('compose-files').value, 'deploy/compose.yaml')
+  ui.element<HTMLFormElement>('compose-form').dispatchEvent(new ui.window.Event('submit', { cancelable: true })); await settle()
+  assert.deepEqual(applied, options)
+  assert.equal(ui.element<HTMLButtonElement>('project-up').disabled, false)
+})

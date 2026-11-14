@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0
+
+- Detect existing Compose stacks from verified working-directory and config-file labels, including nested configs and custom project names.
+- Display their containers and logs immediately without saving or applying settings first; add a detected-stack picker.
+- Match profile memberships to the loaded running services, preserving ambiguous multi-profile memberships.
+- Keep saved settings and working root configurations authoritative, and require Apply before Compose mutations from a detected draft.
+- Retain container visibility when config variables are unresolved, using uninterpolated config metadata where possible.
+- Cover automatic detection, workspace isolation, root priority, profile mapping and explicit adoption with regression and real Docker tests.
+
 ## 0.7.0
 
 - Select workspace-specific environment files, including files in nested directories.

@@ -247,7 +247,11 @@
         <button id="project-down" title="docker compose down: stops and removes the containers" disabled>Down</button>
       </div>
       <div id="docker-context" class="docker-context">Docker: loading…</div>
+      <label id="running-stack-label" class="hint" hidden>Detected Compose stack
+        <select id="running-stack" aria-label="Detected Compose stack"></select>
+      </label>
       <div id="compose-runtime" class="hint" style="white-space:pre-wrap" aria-live="polite"></div>
+      <div id="detection-note" class="hint" hidden></div>
       <details id="compose-settings" class="compose-settings">
         <summary>Compose settings</summary>
         <form id="compose-form">
@@ -264,6 +268,9 @@
           <label>Environment file
             <input id="compose-env-file" list="compose-env-files" placeholder="Automatic .env, or e.g. .docker/.env.dev" />
             <datalist id="compose-env-files"></datalist>
+          </label>
+          <label>Compose project name
+            <input id="compose-project-name" placeholder="Automatic, or the detected stack name" />
           </label>
           <label>Profiles for project commands
             <select id="compose-profile-mode" aria-label="Compose profile source">

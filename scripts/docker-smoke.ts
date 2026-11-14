@@ -23,6 +23,8 @@ if (!image || image.startsWith('-') || !/^[\w./:@-]+$/.test(image)) throw new Er
 await docker(['image', 'inspect', image])
 const root = await realpath(await mkdtemp(join(tmpdir(), 'docker-logs-smoke-')))
 const project = `orca-logs-smoke-${Date.now()}-${process.pid}`
+const autoRoot = join(root, 'auto-workspace')
+const autoProject = `${project}-auto`
 let foreignId: string | null = null
 let worker: Awaited<ReturnType<typeof mountWorker>> | null = null
 try {
@@ -43,6 +45,14 @@ try {
   } }))
   assert.equal(await hasComposeFile(root), true)
   await docker(['compose', 'up', '-d', '--pull', 'never'], root)
+  await mkdir(join(autoRoot, 'deploy'), { recursive: true })
+  await writeFile(join(autoRoot, 'deploy', '.env.original'), `AUTO_IMAGE=${image}\nCOMPOSE_PROFILES=dev\n`)
+  await writeFile(join(autoRoot, 'deploy', 'compose.yaml'), JSON.stringify({ services: {
+    base: service,
+    api: { ...service, image: '${AUTO_IMAGE:?original env file required}', profiles: ['dev', 'shared'], depends_on: ['base'] },
+    idle: { ...service, profiles: ['jobs'] }
+  } }))
+  await docker(['compose', '--env-file', 'deploy/.env.original', '-f', 'deploy/compose.yaml', '-p', autoProject, '--profile', 'dev', 'up', '-d', '--pull', 'never', 'api'], autoRoot)
   let terminalOutput: string[] = []
   const host = mockHost({ settings: { dockerPath: bin }, results: {
     'terminal.create': async ({ command }: { command: string }) => {
@@ -51,9 +61,23 @@ try {
       return { terminalId: 'smoke-operation-terminal' }
     },
     'terminal.read': () => ({ lines: terminalOutput, truncated: false }),
-    'workspace.list': { workspaces: [{ id: 'smoke', name: 'smoke', path: root, branch: 'main', hostId: 'local' }] }
+    'workspace.list': { workspaces: [{ id: 'smoke', name: 'smoke', path: root, branch: 'main', hostId: 'local' }, { id: 'auto-smoke', name: 'auto-smoke', path: autoRoot, branch: 'main', hostId: 'local' }] }
   } })
   worker = await mountWorker(main, { host })
+  const automatic = await worker.request('services.list', { path: autoRoot })
+  assert.equal(automatic.detected, true)
+  assert.equal(automatic.project, autoProject)
+  assert.deepEqual(automatic.options.files, ['deploy/compose.yaml'])
+  assert.deepEqual(automatic.runtime.runningProfiles.map((profile: { name: string }) => profile.name), ['dev', 'shared'])
+  const autoApi = automatic.rows.find((row: ServiceRow) => row.service === 'api') as ServiceRow
+  assert.equal(autoApi.state, 'running')
+  assert.deepEqual((await worker.request('compose.get', { path: autoRoot })).options, { files: [], profiles: [] })
+  const autoLogs = await worker.request('logs.get', { path: autoRoot, targets: [{ service: 'api', name: autoApi.name, containerId: autoApi.containerId }] })
+  assert.ok(autoLogs.lines.some((line: LogLine) => line.m.startsWith('INFO tick')))
+  await assert.rejects(worker.request('project.action', { path: autoRoot, action: 'down' }), { code: 'invalid_params' })
+  assert.equal((await docker(['inspect', '--format', '{{.State.Running}}', autoApi.containerId!])).stdout.trim(), 'true')
+  await worker.request('compose.set', { path: autoRoot, options: { ...automatic.options, envFile: 'deploy/.env.original' } })
+  assert.equal((await worker.request('services.list', { path: autoRoot, fresh: true })).detected, false)
   const discovered = await worker.request('compose.discover', { path: root })
   assert.ok(discovered.files.includes('infra/stack.yml'))
   const preview = await worker.request('compose.profiles', { path: root, files: ['infra/stack.yml'] })
@@ -135,7 +159,7 @@ try {
   assert.deepEqual(base.runtime.enabledServices.sort(), ['app', 'db'])
   await worker.request('project.action', { path: root, action: 'down' })
   assert.equal((await docker(['inspect', '--format', '{{.State.Running}}', tools.containerId!])).stdout.trim(), 'true')
-  console.log('Live Docker smoke passed: root/nested dotenv compatibility, profile inheritance and overrides, scoped project commands, terminal environment isolation, ownership, stdout/stderr logs, Clear, cursors, stats, bind-mount source mapping, operation completion, event streaming, bounded event logs, saved views and restart.')
+  console.log('Live Docker smoke passed: automatic nested-stack/container/profile matching and logs, explicit adoption, root/nested dotenv compatibility, profile inheritance and overrides, scoped project commands, terminal environment isolation, ownership, stdout/stderr logs, Clear, cursors, stats, bind-mount source mapping, operation completion, event streaming, bounded event logs, saved views and restart.')
 } catch (error) {
   const logs = await docker(['compose', '-p', project, '-f', 'infra/stack.yml', 'logs', '--no-color', '--tail', '10'], root).catch(() => null)
   if (logs) console.error(logs.stdout + logs.stderr)
@@ -144,6 +168,7 @@ try {
   await worker?.deactivate()
   let cleanupFailed = false
   if (foreignId) await docker(['rm', '-f', foreignId]).catch((error) => { cleanupFailed = true; console.error(error) })
+  await docker(['compose', '--env-file', 'auto-workspace/deploy/.env.original', '-p', autoProject, '-f', 'auto-workspace/deploy/compose.yaml', '--profile', '*', 'down', '--remove-orphans'], root).catch((error) => { cleanupFailed = true; console.error(error) })
   await docker(['compose', '-p', project, '-f', 'infra/stack.yml', '--profile', '*', 'down', '--remove-orphans'], root).catch((error) => { cleanupFailed = true; console.error(error) })
   if (!cleanupFailed) await rm(root, { recursive: true, force: true })
   else { console.error(`Cleanup needs attention: project ${project}, files ${root}`); process.exitCode = 1 }

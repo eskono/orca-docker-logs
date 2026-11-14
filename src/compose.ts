@@ -6,7 +6,7 @@ import type { ComposeOptions } from './protocol'
 export const defaultOptions = (): ComposeOptions => ({ files: [], profiles: [] })
 
 export function composeArgs(options: ComposeOptions, profiles = options.profiles, envFile?: string): string[] {
-  return ['compose', ...(envFile ? ['--env-file', envFile] : []), ...options.files.flatMap((file) => ['-f', file]), ...[...new Set(profiles)].flatMap((p) => ['--profile', p])]
+  return ['compose', ...(envFile ? ['--env-file', envFile] : []), ...options.files.flatMap((file) => ['-f', file]), ...[...new Set(profiles)].flatMap((p) => ['--profile', p]), ...(options.projectName ? ['-p', options.projectName] : [])]
 }
 
 /** Older Compose versions switch dotenv discovery to the first -f directory. Keep workspace
@@ -23,6 +23,7 @@ export async function validateOptions(path: string, value: ComposeOptions): Prom
   }
   const root = await realpath(path)
   if (value.profileMode !== undefined && !['auto', 'manual'].includes(value.profileMode)) throw fail('invalid_params', 'Invalid profile mode')
+  if (value.projectName !== undefined && (typeof value.projectName !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,254}$/.test(value.projectName))) throw fail('invalid_params', 'Invalid Compose project name')
   const files: string[] = []
   for (const file of value.files) {
     if (typeof file !== 'string' || !file || file.length > 1024 || /[\x00-\x1f]/.test(file) || isAbsolute(file) || file.startsWith('-')) {
@@ -46,5 +47,5 @@ export async function validateOptions(path: string, value: ComposeOptions): Prom
     const checked = await validateOptions(path, { files: [value.envFile], profiles: [] })
     envFile = checked.files[0]
   }
-  return { files: [...new Set(files)], profiles: [...new Set(profiles)], ...(envFile ? { envFile } : {}), ...(value.profileMode ? { profileMode: value.profileMode } : {}) }
+  return { files: [...new Set(files)], profiles: [...new Set(profiles)], ...(envFile ? { envFile } : {}), ...(value.profileMode ? { profileMode: value.profileMode } : {}), ...(value.projectName ? { projectName: value.projectName } : {}) }
 }

@@ -38,6 +38,9 @@ export async function checkRootAndNestedEnv(bin: string): Promise<void> {
     }
     const nested = JSON.parse((await run(bin, ['compose', '--env-file', '.env', '-f', 'nested/compose.yaml', 'config', '--format', 'json'], { cwd: root, timeoutMs: 20_000 })).stdout)
     assert.equal(nested.services.base.environment.ROOT_OVERRIDE, undefined)
+    await writeFile(join(root, '.env'), 'COMPOSE_PROJECT_NAME=INVALID.NAME\nCOMPOSE_PROFILES=dev\n')
+    const explicitName = await composeEnvironment(root, bin, { files: ['compose.yaml'], profiles: [], projectName: 'explicit_name' }, '.env')
+    assert.deepEqual(explicitName.profiles, ['dev'])
     await writeFile(join(root, '.env'), 'COMPOSE_FILE=nested/compose.yaml\nCOMPOSE_PROJECT_NAME=orcaenvcheck\n')
     const redirected = await composeEnvironment(root, bin, { files: [], profiles: [] })
     assert.deepEqual(redirected.profiles, ['tools'])

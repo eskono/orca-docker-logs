@@ -1,5 +1,5 @@
 // Runs the worker over a mock Orca host and a fake docker script that records its calls.
-import { chmod, mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, realpath, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assert, mockHost, mountWorker, test } from 'orca/testing'
@@ -40,8 +40,12 @@ here=$(dirname "$0")
 echo "$(pwd)|$*" >> "$here/calls.log"
 case "$*" in
   *"config --profiles") echo web ;;
-  *"config --format json") exec "${process.execPath}" "$here/render-config.cjs" "$@" ;;
+  *"--format json") exec "${process.execPath}" "$here/render-config.cjs" "$@" ;;
+  "ps -a --no-trunc --filter label=com.docker.compose.project --format "*)
+    if [ -f "$here/stacks.jsonl" ]; then cat "$here/stacks.jsonl"; fi ;;
   "ps -aq --no-trunc --filter label=com.docker.compose.project=proj") printf '${APP}\\n${WORKER}\\n' ;;
+  "ps -aq --no-trunc --filter label=com.docker.compose.project="*)
+    exec "${process.execPath}" "$here/list-project.cjs" "$5" ;;
   "inspect ${APP} ${WORKER}") cat "$here/inspect.json" ;;
   "logs "*"${APP}")
     if [ -f "$here/app-log.txt" ]; then cat "$here/app-log.txt"; exit 0; fi
@@ -78,9 +82,12 @@ async function setup() {
     writeFile(join(project, 'compose.yaml'), 'services: {}\n'),
     writeFile(join(root, 'config.json'), JSON.stringify(CONFIG).replace('__PROJECT__', project)),
     writeFile(join(root, 'inspect.json'), JSON.stringify(INSPECT).replaceAll('__PROJECT__', project)),
+    writeFile(join(root, 'list-project.cjs'), `const fs=require('node:fs'); const path=require('node:path'); const project=process.argv[2].split('=').at(-1); const data=JSON.parse(fs.readFileSync(path.join(__dirname,'inspect.json'),'utf8')); process.stdout.write(data.filter((entry)=>entry.Config.Labels['com.docker.compose.project']===project).map((entry)=>entry.Id).join('\\n'));`),
     writeFile(join(root, 'render-config.cjs'), `const fs = require('node:fs'); const path = require('node:path');
 const args = process.argv.slice(2);
+if (fs.existsSync(path.join(__dirname, 'fail-config')) && !args.includes('--no-interpolate')) { process.stderr.write('Required variable is missing'); process.exit(1) }
 let config = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
+const projectName = args.lastIndexOf('-p'); if (projectName >= 0) config.name = args[projectName + 1];
 const probe = args.find((arg) => arg.endsWith('/probe.json'));
 if (probe) {
   const document = JSON.parse(fs.readFileSync(probe, 'utf8'));
@@ -553,4 +560,71 @@ test('an empty manual selection cannot run project commands when all services ne
   assert.deepEqual(model.runtime.enabledServices, [])
   await assert.rejects(worker.request('project.action', { path: project, action: 'up' }), { code: 'invalid_params' })
   await assert.rejects(worker.request('project.action', { path: project, action: 'down' }), { code: 'invalid_params' })
+})
+
+async function nestedStackFixture() {
+  const fixture = await setup()
+  const { plain, root } = fixture
+  await mkdir(join(plain, 'deploy'))
+  await writeFile(join(plain, 'deploy', 'compose.yaml'), 'services: {}\n')
+  const config = structuredClone(CONFIG)
+  config.services.app = { ...config.services.app, profiles: ['dev', 'shared'] } as typeof config.services.app
+  await writeFile(join(root, 'config.json'), JSON.stringify(config).replace('__PROJECT__', plain))
+  const inspected = structuredClone(INSPECT)
+  for (const entry of inspected) {
+    entry.Config.Labels['com.docker.compose.project.working_dir'] = join(plain, 'deploy')
+    entry.Config.Labels['com.docker.compose.project'] = 'launched_manually'
+  }
+  await writeFile(join(root, 'inspect.json'), JSON.stringify(inspected))
+  await writeFile(join(root, 'stacks.jsonl'), inspected.map((entry) => JSON.stringify({ id: entry.Id, project: 'launched_manually', service: entry.Config.Labels['com.docker.compose.service'], state: entry.State.Status, workingDir: join(plain, 'deploy'), files: join(plain, 'deploy', 'compose.yaml'), envFile: '' })).join('\n'))
+  return fixture
+}
+
+test('automatically displays a nested stack started with a different project name and maps profiles from loaded containers', async (t) => {
+  const { worker, plain } = await nestedStackFixture()
+  t.after(() => worker.deactivate())
+  await writeFile(join(plain, 'compose.yaml'), 'services: {}')
+  await worker.request('compose.set', { path: plain, options: { files: [], profiles: [] } })
+  await unlink(join(plain, 'compose.yaml'))
+  const model = await worker.request('services.list', { path: plain })
+  assert.equal(model.detected, true)
+  assert.equal(model.project, 'launched_manually')
+  assert.equal(model.rows.find((row: any) => row.service === 'app').state, 'running')
+  assert.deepEqual(model.options.files, ['deploy/compose.yaml'])
+  assert.equal(model.options.projectName, 'launched_manually')
+  assert.deepEqual(model.options.profiles, ['dev', 'shared'])
+  assert.deepEqual(model.runtime.runningProfiles, [{ name: 'dev', services: ['app'] }, { name: 'shared', services: ['app'] }])
+  assert.deepEqual((await worker.request('compose.get', { path: plain })).options, { files: [], profiles: [] })
+  const logs = await worker.request('logs.get', { path: plain, targets: [{ service: 'app', containerId: APP, name: 'proj-app-1' }] })
+  assert.equal(logs.lines.length, 3)
+  await assert.rejects(worker.request('project.action', { path: plain, action: 'up' }), { code: 'invalid_params' })
+  await worker.request('compose.set', { path: plain, options: model.options })
+  assert.equal((await worker.request('services.list', { path: plain, fresh: true })).detected, false)
+})
+
+test('detected containers remain visible when config variables cannot resolve, without enabling Compose actions', async (t) => {
+  const { worker, plain, root } = await nestedStackFixture()
+  t.after(() => worker.deactivate())
+  await writeFile(join(root, 'fail-config'), '')
+  const model = await worker.request('services.list', { path: plain })
+  assert.equal(model.rows.find((row: any) => row.service === 'app').state, 'running')
+  assert.deepEqual(model.runtime.runningProfiles.map((profile: any) => profile.name), ['dev', 'shared'])
+  assert.match(model.detectionNote, /could not be resolved/)
+  await assert.rejects(worker.request('project.action', { path: plain, action: 'down' }), { code: 'invalid_params' })
+})
+
+test('a saved root configuration is not replaced by a detected nested stack and stack selection stays workspace-scoped', async (t) => {
+  const { worker, plain, project } = await nestedStackFixture()
+  t.after(() => worker.deactivate())
+  const detected = await worker.request('services.list', { path: plain })
+  await assert.rejects(worker.request('stacks.select', { path: project, id: detected.stacks[0].id }), { code: 'invalid_params' })
+  await writeFile(join(plain, 'compose.yaml'), 'services: {}')
+  await worker.request('compose.set', { path: plain, options: { files: ['compose.yaml'], profiles: [] } })
+  const configured = await worker.request('services.list', { path: plain, fresh: true })
+  assert.equal(configured.detected, false)
+  assert.equal(configured.project, 'proj')
+  assert.deepEqual(configured.options.files, ['compose.yaml'])
+  await worker.request('stacks.select', { path: plain, id: detected.stacks[0].id })
+  assert.equal((await worker.request('services.list', { path: plain })).detected, true)
+  assert.deepEqual((await worker.request('compose.get', { path: plain })).options.files, ['compose.yaml'])
 })

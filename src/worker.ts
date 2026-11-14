@@ -8,9 +8,10 @@ import { composeArgs, composeEnvFile, defaultOptions, validateOptions } from './
 import { discoverComposeFiles } from './compose-discovery'
 import { createLimiter } from './async'
 import { composeEnvironment } from './compose-environment'
+import { RunningStacks, profilesOfRunning } from './running-stacks'
 import { diagnosticSummary } from './diagnostics'
 import { latestTime, timeKey } from './log-time'
-import type { ComposeOptions, ComposeRuntime, DockerContext, FocusContext, LogAnswer, LogLine, ProjectAction, Requests, ServiceAction, ServiceRow, Workspace } from './protocol'
+import type { ComposeOptions, ComposeRuntime, DetectedStack, DockerContext, FocusContext, LogAnswer, LogLine, ProjectAction, Requests, ServiceAction, ServiceRow, Workspace } from './protocol'
 import { openFile, revealTerminal } from './orca-cli'
 import { resolveSource } from './sources'
 import { ProblemTracker, summarize } from './status'
@@ -95,9 +96,12 @@ export default function activate(orca: OrcaWorkerApi): void {
   const events = new Events(orca.storage, undefined, async (path, parsed) => belongsTo(path, { project: parsed.project, workingDir: parsed.workingDir }, parsed.project))
   stopWorker = async () => { stopped = true; await Promise.all([operations.dispose(), events.dispose()]) }
   let cachedWorkspaces: { at: number; list: Workspace[] } | null = null
-  type ConfigEntry = { at: number; config: ComposeConfig; profiles: string[]; options: ComposeOptions; envFile?: string; runtime: ComposeRuntime; commandProfiles: string[]; controls: Record<string, string | undefined> }
+  type ConfigEntry = { at: number; config: ComposeConfig; profiles: string[]; options: ComposeOptions; envFile?: string; runtime: ComposeRuntime; commandProfiles: string[]; controls: Record<string, string | undefined>; detected?: boolean; detectionNote?: string }
   const configCache = new Map<string, ConfigEntry>()
   const scan = createLimiter(4)
+  const runningStacks = new RunningStacks()
+  const selectedStacks = new Map<string, string>()
+  const automaticEntries = new Map<string, { id: string; at: number; entry: ConfigEntry }>()
 
   async function localWorkspaces(fresh = false): Promise<Workspace[]> {
     if (!fresh && cachedWorkspaces && Date.now() - cachedWorkspaces.at < 10_000) return cachedWorkspaces.list
@@ -170,9 +174,48 @@ export default function activate(orca: OrcaWorkerApi): void {
     const rel = relative(root, actual)
     return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
   }
+  async function detectedEntry(path: string, bin: string, stack: DetectedStack, fresh: boolean, signal?: AbortSignal): Promise<ConfigEntry> {
+    const cached = automaticEntries.get(path)
+    if (!fresh && cached?.id === stack.id && Date.now() - cached.at < 15_000) return cached.entry
+    const options: ComposeOptions = { files: stack.files, profiles: [], projectName: stack.project, ...(stack.envFile ? { envFile: stack.envFile } : {}) }
+    let entry: ConfigEntry
+    try {
+      entry = await composeConfig(path, bin, true, options, signal)
+    } catch (error) {
+      signal?.throwIfAborted()
+      let config: ComposeConfig = { name: stack.project, services: {} }
+      try {
+        const raw = await run(bin, [...composeArgs(options, ['*'], stack.envFile), 'config', '--no-interpolate', '--no-normalize', '--format', 'json'], { cwd: path, timeoutMs: 20_000, signal })
+        const unresolved = parseConfig(raw.stdout)
+        config = { name: stack.project, services: Object.fromEntries(Object.entries(unresolved.services).map(([name, service]) => [name, { profiles: service.profiles.filter((profile) => NAME.test(profile)), build: false, mounts: [] }])) }
+      } catch { signal?.throwIfAborted() }
+      entry = { at: Date.now(), config, profiles: [...new Set(Object.values(config.services).flatMap((service) => service.profiles))], options, commandProfiles: [], controls: {},
+        runtime: { environmentProfiles: [], effectiveProfiles: [], profileSource: 'selection', envFile: stack.envFile ?? null, enabledServices: [], runningServices: [], outsideSelection: [] },
+        detectionNote: `Containers found from Compose labels. Config could not be resolved: ${error instanceof Error ? error.message : String(error)}` }
+    }
+    entry = { ...entry, detected: true, detectionNote: entry.detectionNote ?? 'Detected from existing containers. Profiles show running-service memberships, not the original launch flags. Review settings and Apply to enable Compose actions.' }
+    automaticEntries.set(path, { id: stack.id, at: Date.now(), entry })
+    return entry
+  }
+
   async function readProject(path: string, bin: string, fresh = false, signal?: AbortSignal) {
-    const entry = await composeConfig(path, bin, fresh, undefined, signal)
-    const read = async () => {
+    const context = await dockerContext(bin, signal)
+    const stacks = await runningStacks.list(path, bin, `${context.name}\0${context.endpoint}`, signal).catch((error) => { signal?.throwIfAborted(); orca.log(`Stack discovery: ${error instanceof Error ? error.message : String(error)}`); return [] as DetectedStack[] })
+    const saved = await orca.storage.get(keyFor('compose', path)) as ComposeOptions | null
+    const pinned = !!saved && (saved.files.length > 0 || !!saved.envFile || !!saved.projectName || saved.profiles.length > 0 || saved.profileMode === 'manual')
+    let selected = stacks.find((stack) => stack.id === selectedStacks.get(path))
+    let entry: ConfigEntry
+    if (selected) entry = await detectedEntry(path, bin, selected, fresh, signal)
+    else {
+      try { entry = await composeConfig(path, bin, fresh, undefined, signal) }
+      catch (error) {
+        signal?.throwIfAborted()
+        if (pinned || !stacks.length) throw error
+        selected = stacks[0]
+        entry = await detectedEntry(path, bin, selected, fresh, signal)
+      }
+    }
+    const read = async (): Promise<Container[]> => {
       const ids = lines((await run(bin, ['ps', '-aq', '--no-trunc', '--filter', `label=com.docker.compose.project=${entry.config.name}`], { timeoutMs: 20_000, signal })).stdout)
       if (ids.length > MAX_CONTAINERS) throw fail('action_failed', `Project exceeds the ${MAX_CONTAINERS} container limit`)
       if (!ids.length) return []
@@ -180,15 +223,30 @@ export default function activate(orca: OrcaWorkerApi): void {
       if (inspected.length !== ids.length) throw fail('not_permitted', 'Could not verify every container in this Compose project')
       return inspected
     }
-    const containers = await read().catch(async (error) => { signal?.throwIfAborted(); return read() })
-    const membership = await Promise.all(containers.map((c) => belongsTo(path, c, entry.config.name)))
+    let containers = await read().catch(async () => { signal?.throwIfAborted(); return read() })
+    let membership = await Promise.all(containers.map((c) => belongsTo(path, c, entry.config.name)))
+    if (!membership.some(Boolean) && !pinned && !selected && stacks.length) {
+      selected = stacks[0]
+      entry = await detectedEntry(path, bin, selected, fresh, signal)
+      containers = await read().catch(async () => { signal?.throwIfAborted(); return read() })
+      membership = await Promise.all(containers.map((c) => belongsTo(path, c, entry.config.name)))
+    }
+    const owned = containers.filter((_, i) => membership[i])
+    const runningProfiles = profilesOfRunning(entry.config, owned)
+    if (entry.detected) {
+      const profiles = runningProfiles.map((profile) => profile.name)
+      const options: ComposeOptions = { ...entry.options, profiles, ...(!profiles.length ? { profileMode: 'manual' } : {}) }
+      const config = { ...entry.config, services: { ...entry.config.services } }
+      for (const container of owned) config.services[container.service] ??= { profiles: [], build: false, mounts: [] }
+      entry = { ...entry, config, options, runtime: { ...entry.runtime, effectiveProfiles: profiles, profileSource: 'selection', enabledServices: [...new Set(owned.map((c) => c.service))] } }
+    }
     return {
-      ...entry,
+      ...entry, context, stacks,
       project: entry.config.name,
-      rows: buildRows(entry.config, containers.filter((_, i) => membership[i])),
-      runtime: { ...entry.runtime,
-        runningServices: [...new Set(containers.filter((c, i) => membership[i] && ['running', 'restarting', 'paused'].includes(c.state)).map((c) => c.service))],
-        outsideSelection: [...new Set(containers.filter((c, i) => membership[i] && ['running', 'restarting', 'paused'].includes(c.state) && !entry.runtime.enabledServices.includes(c.service)).map((c) => c.service))]
+      rows: buildRows(entry.config, owned),
+      runtime: { ...entry.runtime, runningProfiles,
+        runningServices: [...new Set(owned.filter((c) => ['running', 'restarting', 'paused'].includes(c.state)).map((c) => c.service))],
+        outsideSelection: [...new Set(owned.filter((c) => ['running', 'restarting', 'paused'].includes(c.state) && !entry.runtime.enabledServices.includes(c.service)).map((c) => c.service))]
       },
       foreign: containers.some((_, i) => !membership[i])
     }
@@ -244,7 +302,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     },
     'compose.profiles': async (input, signal) => {
       const { path } = await workspaceFor(input.path)
-      const options = await validateOptions(path, { files: input.files, profiles: input.profiles ?? [], ...(input.envFile ? { envFile: input.envFile } : {}), ...(input.profileMode ? { profileMode: input.profileMode } : {}) })
+      const options = await validateOptions(path, { files: input.files, profiles: input.profiles ?? [], ...(input.envFile ? { envFile: input.envFile } : {}), ...(input.profileMode ? { profileMode: input.profileMode } : {}), ...(input.projectName ? { projectName: input.projectName } : {}) })
       const model = await composeConfig(path, await docker(), true, options, signal)
       return { profiles: model.profiles, runtime: model.runtime }
     },
@@ -255,13 +313,27 @@ export default function activate(orca: OrcaWorkerApi): void {
       if (options.profileMode !== 'auto' && options.profiles.some((profile) => !model.profiles.includes(profile))) throw invalid('Unknown Compose profile; choose one of the available profiles')
       await orca.storage.set(keyFor('compose', path), options)
       configCache.delete(path)
+      selectedStacks.delete(path)
+      automaticEntries.delete(path)
       return { options }
+    },
+    'stacks.select': async (input, signal) => {
+      const { path } = await workspaceFor(input.path)
+      if (input.id === null) selectedStacks.delete(path)
+      else {
+        const bin = await docker()
+        const context = await dockerContext(bin, signal)
+        const stacks = await runningStacks.list(path, bin, `${context.name}\0${context.endpoint}`, signal)
+        if (typeof input.id !== 'string' || !stacks.some((stack) => stack.id === input.id)) throw invalid('This stack is not a verified configuration of this workspace')
+        selectedStacks.set(path, input.id)
+      }
+      return { selected: true }
     },
     'services.list': async (input, signal) => {
       const { path } = await workspaceFor(input.path)
       const bin = await docker()
-      const { project, rows, options, profiles, runtime } = await readProject(path, bin, input.fresh === true, signal)
-      return { project, rows, options, profiles, runtime, context: await dockerContext(bin, signal) }
+      const { project, rows, options, profiles, runtime, context, stacks, detected, detectionNote } = await readProject(path, bin, input.fresh === true, signal)
+      return { project, rows, options, profiles, runtime, context, stacks, detected: detected === true, detectionNote: detectionNote ?? null }
     },
     'views.get': async (input) => {
       const { path } = await workspaceFor(input.path)
@@ -280,8 +352,8 @@ export default function activate(orca: OrcaWorkerApi): void {
     'events.list': async (input, signal) => {
       const { path } = await workspaceFor(input.path)
       const bin = await docker()
-      const model = await composeConfig(path, bin, false, undefined, signal)
-      return watchEvents(path, bin, { project: model.config.name })
+      const model = await readProject(path, bin, false, signal)
+      return watchEvents(path, bin, { project: model.project })
     },
     'operations.list': async (input) => ({ operations: await operations.list((await workspaceFor(input.path)).path) }),
     'operations.open': async (input) => {
@@ -357,9 +429,10 @@ export default function activate(orca: OrcaWorkerApi): void {
       if (id !== null) ownedRow(model.rows, id, service)
       if (action === 'build' || (action === 'start' && id === null)) {
         noForeign(model.foreign)
+        if (model.detected) throw invalid('Review and Apply the detected configuration before creating or rebuilding services')
         const declared = model.config.services[service]
         if (!declared) throw invalid('Unknown Compose service')
-        const args = [...composeArgs(model.options, model.commandProfiles, model.envFile), '-p', model.project, 'up', '-d', ...(action === 'build' ? ['--build'] : []), service]
+        const args = [...composeArgs({ ...model.options, projectName: model.project }, model.commandProfiles, model.envFile), 'up', '-d', ...(action === 'build' ? ['--build'] : []), service]
         return { terminalId: await openTerminal(path, `${action === 'build' ? 'build' : 'up'} ${service}`, args, bin, { service }, model.controls) }
       }
       if (id === null) throw invalid('The service has no container')
@@ -372,9 +445,10 @@ export default function activate(orca: OrcaWorkerApi): void {
       const bin = await docker()
       const model = await readProject(path, bin, true, signal)
       noForeign(model.foreign)
+      if (model.detected) throw invalid('Review and Apply the detected configuration before running Compose actions')
       if (!model.runtime.enabledServices.length) throw invalid('No services are enabled; choose a profile before running project commands')
-      if (input.action === 'up') return { terminalId: await openTerminal(path, 'compose up', [...composeArgs(model.options, model.commandProfiles, model.envFile), '-p', model.project, 'up', '-d'], bin, { service: null }, model.controls) }
-      await operations.run(path, `compose ${input.action}`, null, () => run(bin, [...composeArgs(model.options, model.commandProfiles, model.envFile), '-p', model.project, input.action], { cwd: path, timeoutMs: 115_000, signal, env: model.controls }))
+      if (input.action === 'up') return { terminalId: await openTerminal(path, 'compose up', [...composeArgs({ ...model.options, projectName: model.project }, model.commandProfiles, model.envFile), 'up', '-d'], bin, { service: null }, model.controls) }
+      await operations.run(path, `compose ${input.action}`, null, () => run(bin, [...composeArgs({ ...model.options, projectName: model.project }, model.commandProfiles, model.envFile), input.action], { cwd: path, timeoutMs: 115_000, signal, env: model.controls }))
       return { terminalId: null }
     },
     'container.shell': async (input, signal) => {
@@ -392,7 +466,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       const service = checkName(input.service, 'service name')
       const files = (Array.isArray(input.files) ? input.files : []).map(checkTracePath)
       if (files.length > 200) throw invalid('Too many files')
-      const mounts = (await composeConfig(path, await docker(), false, undefined, signal)).config.services[service]?.mounts ?? []
+      const mounts = (await readProject(path, await docker(), false, signal)).config.services[service]?.mounts ?? []
       const found = await Promise.all(files.map((file) => resolveSource(path, mounts, file)))
       return { files: Object.fromEntries(files.map((file, i) => [file, found[i]])) }
     },
@@ -402,7 +476,7 @@ export default function activate(orca: OrcaWorkerApi): void {
       const file = checkTracePath(input.file)
       const line = checkPosition(input.line, 'line')
       const column = input.column === undefined ? undefined : checkPosition(input.column, 'column')
-      const mounts = (await composeConfig(path, await docker(), false, undefined, signal)).config.services[service]?.mounts ?? []
+      const mounts = (await readProject(path, await docker(), false, signal)).config.services[service]?.mounts ?? []
       const relative = await resolveSource(path, mounts, file)
       if (!relative) throw fail('action_failed', `${file} is not a file of this project`)
       await openFile(path, relative, line, column)
