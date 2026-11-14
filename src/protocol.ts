@@ -104,7 +104,7 @@ export type SavedView = {
 }
 
 export type Requests = {
-  /** Local workspaces that have a compose file, and the focused one when it can be resolved. */
+  /** All local workspaces in stable folder order, and the focused one when it can be resolved. */
   'workspaces.list': {
     input: { context: FocusContext }
     output: { workspaces: Workspace[]; focused: Workspace | null }

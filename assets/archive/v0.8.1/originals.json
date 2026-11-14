@@ -1,0 +1,25 @@
+{
+  "sourceCommit": "1dad504f8059acf570f879b133f46da722808c00",
+  "images": [
+    {
+      "file": "cover.webp",
+      "sha256": "6fd571fa2005ccd56a3efba702b94182f91fafb9310b078d1d5112edf45943d2",
+      "bytes": 89308
+    },
+    {
+      "file": "screenshot-dark.webp",
+      "sha256": "5fa25fe8ee473559c6568035e87d0487e169253415cebe28d9b6f6a8e42322ea",
+      "bytes": 194782
+    },
+    {
+      "file": "screenshot-light.webp",
+      "sha256": "e82c2e350960e63dd2ae9d82cde98b7b3312c8814f82451f325f30faf59e19fe",
+      "bytes": 207500
+    },
+    {
+      "file": "screenshot-all.webp",
+      "sha256": "e282b9255d313b00bfcba8307acc8ff733ee951cb23c68cfa41bbaf4d392c4ff",
+      "bytes": 290734
+    }
+  ]
+}

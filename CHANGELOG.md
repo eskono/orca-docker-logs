@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.2
+
+- Refresh the cover and dark, light and combined-log screenshots using the current panel with demonstration data.
+- Add gallery images for nested Compose configs, environment/profile selection and detected running stacks.
+- Preserve all previous gallery images under `assets/archive/v0.8.1/` with original checksums.
+- Update the plugin description, gallery captions and README to explain current setup and detection behavior.
+
 ## 0.8.1
 
 - Keep every local Orca workspace selectable regardless of focus or Compose discovery results.

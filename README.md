@@ -1,14 +1,22 @@
 # Docker Logs
 
-An Orca sidebar panel for the Docker Compose containers of the focused project: state, CPU and
-memory over time, ports, start / stop / restart / rebuild, a shell, and a live log with error
-highlighting whose stack traces open the code, and that you can hand to your agent in one click.
+A Docker Compose sidebar for Orca. Discover configs in the project root or nested folders,
+choose `.env` files and profiles, and match already running stacks to their configs. See
+container health, CPU, memory and ports alongside searchable live logs, linked stack traces
+and **Ask agent**.
 
-**Catalog listing:** [Docker Logs on Orca](https://www.onorca.dev/plugins/eskono/orca-docker-logs).
+**Catalog listing:** [Docker Logs on Orca](https://orca.dev/plugins/eskono/orca-docker-logs).
 It runs its own worker (it calls the `docker` CLI, opens terminals and starts agents), so Orca
 asks you to approve full access.
 
-![The panel: services with CPU, memory and ports above the api container's log](assets/screenshot-dark.webp)
+![Docker Logs: Compose profiles, containers and searchable logs inside Orca](assets/cover.webp)
+
+## Start with your project
+
+1. Choose a local project in the picker. All local Orca workspaces stay available in alphabetical folder order.
+2. Root Compose files and `.env` work automatically. Existing stacks can also appear from their verified Compose labels, including stacks launched from nested folders.
+3. For a custom setup, open **Compose settings**, select the base file and overrides in order, choose an environment file and preview the profiles. Apply the settings to save them for this project.
+4. Select a container, combine services or choose **All services** to follow logs. Detected settings stay a draft until Apply; existing container logs are available immediately.
 
 ## What it does
 
@@ -23,7 +31,7 @@ asks you to approve full access.
   (one workspace-relative path per line) and profile names manually. Settings are
   checked before saving and belong to that workspace. Custom files keep the workspace's `.env`
   when present, unless `COMPOSE_ENV_FILES` or `COMPOSE_DISABLE_ENV_FILE` overrides dotenv use.
-  Build/bind paths still resolve from the first Compose file. Empty fields restore Compose defaults.
+  Build/bind paths still resolve from the first Compose file. **Use defaults** restores Compose's automatic file, dotenv and profile behavior.
 - **Environment and effective profiles.** Choose an environment file, including nested
   `.env.dev` / `.env.prod` files, or keep automatic dotenv behavior. **From environment** uses
   `COMPOSE_PROFILES` resolved by Compose; **Choose profiles** overrides the service selection,
@@ -113,6 +121,27 @@ asks you to approve full access.
   restarting or turns unhealthy, with a desktop notification when that happens (Settings can turn
   notifications off). OOM kills and unexpected increases in restart count are included.
 
+## Screenshots
+
+These images render the current panel with demonstration data; they contain no private project paths or logs.
+
+![Nested Compose configs, ordered overrides, environment files and inherited profiles](assets/screenshot-compose.webp)
+
+![A detected running stack with its config files, custom project name and observed profile memberships](assets/screenshot-detected.webp)
+
+<details>
+<summary>Container logs, combined views and the light theme</summary>
+
+![Containers, effective profiles, health, stats and searchable logs in dark mode](assets/screenshot-dark.webp)
+
+![Merged logs from all services beside a view filtered to warnings and errors](assets/screenshot-all.webp)
+
+![The same current panel in a light theme](assets/screenshot-light.webp)
+
+</details>
+
+The [previous images](assets/archive/v0.8.1/README.md) are preserved with checksums for restoration.
+
 ## Log history and limits
 
 Logs are polled every two seconds while Follow is enabled and the panel is visible. Later polls
@@ -191,7 +220,7 @@ them with a workspace. Container inspection and actions remain scoped to the sel
 | `src/async.ts`       | Shared Docker process concurrency budget                                   |
 | `src/sources.ts`     | Which project file a stack trace path in a container is                    |
 | `src/orca-cli.ts`    | The `orca` CLI calls: terminal lookup and switch, opening a file at a line |
-| `src/workspaces.ts`  | Local workspaces with compose files; which one is focused                  |
+| `src/workspaces.ts`  | Stable local workspace choices, root Compose detection and focus resolution |
 | `src/protocol.ts`    | Request and answer types shared by the panel and the worker                |
 | `panel/index.html`   | Panel markup and styles (Orca theme variables)                             |
 | `panel/main.ts`      | Panel logic: project, containers, actions, logs                            |

@@ -2,8 +2,8 @@
   "manifestVersion": 2,
   "id": "docker-logs",
   "name": "Docker Logs",
-  "version": "0.8.1",
-  "description": "Docker Compose in Orca: combined live logs, saved views, context-preserving search, collapsible stack traces, operation progress, container events, diagnostics and Ask agent.",
+  "version": "0.8.2",
+  "description": "Docker Compose inside Orca: discover root and nested configs, detect running stacks, resolve .env profiles, and inspect containers, live logs, stats and errors with Ask agent.",
   "author": {
     "name": "Maksim Shevchuk"
   },
@@ -12,25 +12,37 @@
   "icon": "assets/icon.png",
   "cover": {
     "path": "assets/cover.webp",
-    "alt": "Docker Logs: a sidebar panel listing Compose services with CPU, memory and ports above a live container log"
+    "alt": "Docker Logs in Orca: effective and running profiles, container health, resource usage, ports, log search and a collapsed Python traceback"
   },
   "screenshots": [
     {
       "path": "assets/screenshot-dark.webp",
-      "alt": "Docker Logs panel: Compose services with CPU and memory charts, ports and actions, above an api log with a linked Python traceback",
-      "caption": "CPU and memory history and ports per service; the log with errors highlighted and the stack trace linked to the code",
+      "alt": "Current Docker Logs panel in dark mode showing Compose profiles, six services, container health, CPU, memory, ports and searchable API logs",
+      "caption": "Profiles, container health, resource stats, ports and searchable logs. Demonstration data.",
       "theme": "dark"
     },
     {
       "path": "assets/screenshot-light.webp",
-      "alt": "The same Docker Logs panel in a light theme",
-      "caption": "CPU and memory history and ports per service; the log with errors highlighted and the stack trace linked to the code",
+      "alt": "Current Docker Logs panel with the same container, profile and log controls in a light theme",
+      "caption": "The same tools in a light theme: container state, resource usage, live logs and Ask agent. Demonstration data.",
       "theme": "light"
     },
     {
       "path": "assets/screenshot-all.webp",
-      "alt": "Two panels: every service’s log merged and tagged by container, and the same log filtered to errors only",
-      "caption": "All services in one log, and errors only, ready for Ask agent"
+      "alt": "Two current panels comparing all services' merged logs with the same logs filtered to warnings and errors",
+      "caption": "Merged service logs beside warnings and errors, with saved views. Demonstration data."
+    },
+    {
+      "path": "assets/screenshot-compose.webp",
+      "alt": "Compose settings showing nested base and override files, a nested environment file, inherited web and jobs profiles and enabled services",
+      "caption": "Ordered nested configs and environment profiles, previewed before Apply. Demonstration data.",
+      "theme": "dark"
+    },
+    {
+      "path": "assets/screenshot-detected.webp",
+      "alt": "Detected Compose stack picker with a custom project name, running-service profile memberships and verified existing containers",
+      "caption": "Detect running stacks from nested configs and review settings before Apply. Demonstration data.",
+      "theme": "dark"
     }
   ],
   "engines": {
