@@ -1153,6 +1153,14 @@ async function loadServices(fresh = false): Promise<void> {
     state.project = answer.project
     state.runtime = answer.runtime ?? null
     if (answer.runtime) els.composeRuntime.textContent = runtimeText(answer.runtime, true)
+    if (answer.runtime && !composeEdited && JSON.stringify(composeDraft()) === JSON.stringify(answer.options)) {
+      profileRequests.invalidate()
+      previewRuntime = answer.runtime
+      previewProfiles = answer.profiles
+      renderComposeProfiles()
+      els.composeProfileStatus.style.whiteSpace = 'pre-wrap'
+      els.composeProfileStatus.textContent = runtimeText(answer.runtime)
+    }
     state.rows = answer.rows
     state.dockerContext = answer.context
     const firstLoad = !state.servicesLoaded

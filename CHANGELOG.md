@@ -4,6 +4,7 @@
 
 - Select workspace-specific environment files, including files in nested directories.
 - Resolve inherited `COMPOSE_PROFILES` through Compose and distinguish automatic, manual and base-only selections.
+- Refresh inherited profile choices after dotenv changes while preserving unsaved edits.
 - Show effective project-command profiles separately from observed running services and services outside the selection.
 - Use the same files, environment and profile set for Up, Restart and Down; pin project identity and mirror Compose exports in terminal actions.
 - Preserve native `.env` interpolation, root configs and automatic root overrides; keep application environment values out of profile metadata.

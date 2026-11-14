@@ -403,3 +403,23 @@ test('an old env-file preview cannot change the profile selection for a newer en
   assert.doesNotMatch(ui.element('compose-profile-status').textContent!, /\.env.dev|\.env.base/)
   assert.equal(ui.window.document.querySelector<HTMLInputElement>('[aria-label="Enable Compose profile production"]')!.checked, true)
 })
+
+test('refreshes inherited profile checkboxes after dotenv changes while preserving an edited selection', async (t) => {
+  let profile = 'dev'
+  const runtime = () => ({ environmentProfiles: [profile], effectiveProfiles: [profile], profileSource: 'environment', envFile: null, enabledServices: ['app'], runningServices: ['app'], outsideSelection: [] })
+  const ui = await panel((name, input) => {
+    if (name === 'compose.profiles') return { profiles: ['dev', 'production'], runtime: runtime() }
+    if (name === 'services.list') return { project: 'A', rows: [row(A.path)], options: { files: [], profiles: [] }, profiles: ['dev', 'production'], runtime: runtime(), context: { name: 'default', endpoint: '', remote: false } }
+  })
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  profile = 'production'; ui.poll(5000); await settle()
+  const production = ui.window.document.querySelector<HTMLInputElement>('[aria-label="Enable Compose profile production"]')!
+  assert.equal(production.checked, true)
+  const manual = ui.element<HTMLInputElement>('compose-profiles')
+  manual.value = 'dev'; manual.dispatchEvent(new ui.window.Event('input'))
+  ui.poll(5000); await settle()
+  assert.equal(ui.element<HTMLSelectElement>('compose-profile-mode').value, 'manual')
+  assert.equal(manual.value, 'dev')
+  assert.equal(ui.window.document.querySelector<HTMLInputElement>('[aria-label="Enable Compose profile dev"]')!.checked, true)
+})
