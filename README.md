@@ -17,13 +17,24 @@ asks you to approve full access.
   `docker-compose.yml`, their `.override`, `COMPOSE_FILE` from `.env`). Services of every
   profile are listed; one that never ran shows its profile and starts with it. **Compose settings**
   lists configs from project folders, including nested paths such as `.docker/local/dev.yml`,
-  and lets you select their profiles for Up before applying the settings. Select the base file
+  and lets you select their profiles for project commands before applying the settings. Select the base file
   first, then any overrides; their order is shown and can be edited in the path field. Projects
   with only nested configs also appear in the project picker. You can still enter custom paths
   (one workspace-relative path per line) and profile names manually. Settings are
   checked before saving and belong to that workspace. Custom files keep the workspace's `.env`
   when present, unless `COMPOSE_ENV_FILES` or `COMPOSE_DISABLE_ENV_FILE` overrides dotenv use.
   Build/bind paths still resolve from the first Compose file. Empty fields restore Compose defaults.
+- **Environment and effective profiles.** Choose an environment file, including nested
+  `.env.dev` / `.env.prod` files, or keep automatic dotenv behavior. **From environment** uses
+  `COMPOSE_PROFILES` resolved by Compose; **Choose profiles** overrides the service selection,
+  and an empty manual selection enables only base services. Profile choices do not rewrite the
+  `.env` variable used for interpolation inside YAML. The preview shows environment profiles,
+  effective profiles and enabled services; the project summary separately shows actual running
+  services and those outside the selected set. Running containers are not treated as proof of
+  which profiles were originally used to start them.
+  Up, Restart and Down use the same profile set, env file and project name. Terminal actions
+  preserve the worker's Compose control variables even when a terminal has different exports.
+  Explicit per-container actions still target the container/service you clicked.
 - **State at a glance.** A dot per container (running, starting, unhealthy, crashed), uptime,
   CPU and memory from `docker stats` with a small chart of the last minutes (line: CPU, dashes:
   memory). Click a published port to copy its address; the adjacent arrow opens recognized web
@@ -115,6 +126,11 @@ Config discovery recognizes standard Compose filenames and YAML files with top-l
 or `include` keys. It skips dependency/metadata folders and symlinks, and scans up to 20,000
 entries / 1000 directories, returning at most 200 configs. **Rescan folders** refreshes the list;
 paths can also be entered manually if a scan reaches its limit or a custom file is not recognized.
+Env-file discovery returns filenames only. Environment metadata is resolved by Compose, including
+on Compose 2.17; temporary interpolation probes contain references, not resolved application
+values, and are removed after use. Application environment values are not included in profile
+metadata sent to the panel. Root configs, their automatic overrides and root `.env` keep the
+existing discovery behavior; selecting a nested file does not merge root overrides into it.
 
 ## Settings
 
@@ -152,6 +168,7 @@ paths can also be entered manually if a scan reaches its limit or a custom file 
 | `src/status.ts`      | Status bar summary and which container problems notify                     |
 | `src/compose.ts`     | Compose command arguments and validation of workspace configuration        |
 | `src/compose-discovery.ts` | Bounded discovery of Compose configs in project folders               |
+| `src/compose-environment.ts` | Compose-resolved environment/profile metadata across supported CLI versions |
 | `src/diagnostics.ts` | Container diagnostics shared by the panel and agent hand-off               |
 | `src/operations.ts`  | Tracked command output, exit status and persisted operation history         |
 | `src/events.ts`      | Bounded Docker event streams, reconnects and persisted timelines            |
@@ -201,6 +218,9 @@ foreign-container fixture, and removes those fixtures in `finally`. It never pul
 This checks nested `COMPOSE_FILE`, project ownership, profiles, logs, stats, Clear, cursors,
 bind-mount source mapping, restart, operation completion, events, bounded event logs and saved
 views against a real daemon. It requires Docker socket access.
+The smoke check also covers root/override dotenv compatibility, nested env files, profile
+inheritance and base-only overrides, project commands leaving other profiles alone, and Up
+running from a terminal with conflicting Compose exports. All fixtures are disposable.
 
 `tsconfig.json` is self-contained. `types/worker.ts` describes the worker API surface used here,
 so type checking works even with Orca builds whose `plugin types` command cannot generate

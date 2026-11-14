@@ -4,7 +4,11 @@
 export type Workspace = { id: string; name: string; path: string; branch: string | null }
 
 /** Empty lists preserve Compose's normal file discovery and active profiles. */
-export type ComposeOptions = { files: string[]; profiles: string[] }
+export type ComposeOptions = { files: string[]; profiles: string[]; envFile?: string; profileMode?: 'auto' | 'manual' }
+export type ComposeRuntime = {
+  environmentProfiles: string[]; effectiveProfiles: string[]; profileSource: 'environment' | 'selection'
+  envFile: string | null; enabledServices: string[]; runningServices: string[]; outsideSelection: string[]
+}
 export type DockerContext = { name: string; endpoint: string; remote: boolean }
 export type PortBinding = { port: number; containerPort: number; host: string }
 
@@ -106,11 +110,11 @@ export type Requests = {
   /** Compose services of a workspace (every profile) with their containers. */
   'services.list': {
     input: { path: string; fresh?: boolean }
-    output: { project: string; rows: ServiceRow[]; context: DockerContext; options: ComposeOptions; profiles: string[] }
+    output: { project: string; rows: ServiceRow[]; context: DockerContext; options: ComposeOptions; profiles: string[]; runtime: ComposeRuntime }
   }
   'compose.get': { input: { path: string }; output: { options: ComposeOptions } }
-  'compose.discover': { input: { path: string }; output: { files: string[]; truncated: boolean } }
-  'compose.profiles': { input: { path: string; files: string[] }; output: { profiles: string[] } }
+  'compose.discover': { input: { path: string }; output: { files: string[]; envFiles: string[]; truncated: boolean } }
+  'compose.profiles': { input: { path: string; files: string[]; envFile?: string; profiles?: string[]; profileMode?: 'auto' | 'manual' }; output: { profiles: string[]; runtime: ComposeRuntime } }
   'compose.set': { input: { path: string; options: ComposeOptions }; output: { options: ComposeOptions } }
   'operations.list': { input: { path: string }; output: { operations: Operation[] } }
   'operations.open': { input: { path: string; id: string }; output: { opened: true } }

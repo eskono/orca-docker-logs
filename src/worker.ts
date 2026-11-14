@@ -7,9 +7,10 @@ import { buildRows, byTime, containerLines, fail, findDocker, lines, newestWithi
 import { composeArgs, composeEnvFile, defaultOptions, validateOptions } from './compose'
 import { discoverComposeFiles } from './compose-discovery'
 import { createLimiter } from './async'
+import { composeEnvironment } from './compose-environment'
 import { diagnosticSummary } from './diagnostics'
 import { latestTime, timeKey } from './log-time'
-import type { ComposeOptions, DockerContext, FocusContext, LogAnswer, LogLine, ProjectAction, Requests, ServiceAction, ServiceRow, Workspace } from './protocol'
+import type { ComposeOptions, ComposeRuntime, DockerContext, FocusContext, LogAnswer, LogLine, ProjectAction, Requests, ServiceAction, ServiceRow, Workspace } from './protocol'
 import { openFile, revealTerminal } from './orca-cli'
 import { resolveSource } from './sources'
 import { ProblemTracker, summarize } from './status'
@@ -94,7 +95,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   const events = new Events(orca.storage, undefined, async (path, parsed) => belongsTo(path, { project: parsed.project, workingDir: parsed.workingDir }, parsed.project))
   stopWorker = async () => { stopped = true; await Promise.all([operations.dispose(), events.dispose()]) }
   let cachedWorkspaces: { at: number; list: Workspace[] } | null = null
-  type ConfigEntry = { at: number; config: ComposeConfig; profiles: string[]; options: ComposeOptions; envFile?: string }
+  type ConfigEntry = { at: number; config: ComposeConfig; profiles: string[]; options: ComposeOptions; envFile?: string; runtime: ComposeRuntime; commandProfiles: string[]; controls: Record<string, string | undefined> }
   const configCache = new Map<string, ConfigEntry>()
   const scan = createLimiter(4)
 
@@ -124,9 +125,25 @@ export default function activate(orca: OrcaWorkerApi): void {
     const cached = configCache.get(path)
     if (!fresh && !override && cached && JSON.stringify(cached.options) === JSON.stringify(options) && Date.now() - cached.at < 15_000) return cached
     const envFile = await composeEnvFile(path, options)
-    const profiles = lines((await run(bin, [...composeArgs(options, [], envFile), 'config', '--profiles'], { cwd: path, timeoutMs: 20_000, signal })).stdout)
-    const json = await run(bin, [...composeArgs(options, profiles, envFile), 'config', '--format', 'json'], { cwd: path, timeoutMs: 20_000, signal })
-    const entry = { at: Date.now(), config: parseConfig(json.stdout), profiles, options, envFile }
+    const environment = await composeEnvironment(path, bin, options, envFile, signal)
+    const manual = options.profileMode ? options.profileMode === 'manual' : options.profiles.length > 0
+    const effectiveProfiles = manual ? options.profiles : environment.profiles
+    const env = Object.fromEntries(['COMPOSE_FILE', 'COMPOSE_PROFILES', 'COMPOSE_PATH_SEPARATOR', 'COMPOSE_PROJECT_NAME', 'COMPOSE_ENV_FILES', 'COMPOSE_DISABLE_ENV_FILE', 'COMPOSE_REMOVE_ORPHANS', 'COMPOSE_IGNORE_ORPHANS'].map((key) => [key, process.env[key]]))
+    const json = await run(bin, [...composeArgs(options, ['*'], envFile), 'config', '--format', 'json'], { cwd: path, timeoutMs: 20_000, signal, env })
+    const config = parseConfig(json.stdout)
+    const profiles = [...new Set(Object.values(config.services).flatMap((service) => service.profiles))]
+    if (manual && options.profiles.some((profile) => profile !== '*' && !profiles.includes(profile))) throw invalid('Unknown Compose profile; choose one of the available profiles')
+    // An unused profile suppresses COMPOSE_PROFILES without rewriting its interpolation value.
+    let baseProfile = 'orca_base_only'
+    while (profiles.includes(baseProfile)) baseProfile += '_'
+    const commandProfiles = effectiveProfiles.length ? effectiveProfiles : [baseProfile]
+    let enabledServices: string[] = []
+    if (Object.values(config.services).some((service) => !service.profiles.length || effectiveProfiles.includes('*') || service.profiles.some((profile) => effectiveProfiles.includes(profile)))) {
+      const active = await run(bin, [...composeArgs(options, commandProfiles, envFile), 'config', '--format', 'json'], { cwd: path, timeoutMs: 20_000, signal, env })
+      enabledServices = Object.keys(parseConfig(active.stdout).services)
+    }
+    const runtime: ComposeRuntime = { environmentProfiles: environment.profiles, effectiveProfiles, profileSource: manual ? 'selection' : 'environment', envFile: envFile ?? null, enabledServices, runningServices: [], outsideSelection: [] }
+    const entry = { at: Date.now(), config, profiles, options, envFile, runtime, commandProfiles, controls: env }
     if (!override) configCache.set(path, entry)
     return entry
   }
@@ -169,6 +186,10 @@ export default function activate(orca: OrcaWorkerApi): void {
       ...entry,
       project: entry.config.name,
       rows: buildRows(entry.config, containers.filter((_, i) => membership[i])),
+      runtime: { ...entry.runtime,
+        runningServices: [...new Set(containers.filter((c, i) => membership[i] && ['running', 'restarting', 'paused'].includes(c.state)).map((c) => c.service))],
+        outsideSelection: [...new Set(containers.filter((c, i) => membership[i] && ['running', 'restarting', 'paused'].includes(c.state) && !entry.runtime.enabledServices.includes(c.service)).map((c) => c.service))]
+      },
       foreign: containers.some((_, i) => !membership[i])
     }
   }
@@ -184,12 +205,16 @@ export default function activate(orca: OrcaWorkerApi): void {
     const problem = await revealTerminal(terminalId)
     if (problem) orca.log(`could not switch to terminal ${terminalId}: ${problem}`)
   }
-  async function openTerminal(path: string, title: string, args: string[], bin: string, tracked?: { service: string | null }): Promise<string> {
+  async function openTerminal(path: string, title: string, args: string[], bin: string, tracked?: { service: string | null }, environment?: Record<string, string | undefined>): Promise<string> {
     const workspace = await workspaceFor(path)
     const context = await dockerContext(bin)
     // The terminal may have a different environment from the worker: pin the Docker target it showed.
     const target = !process.env.DOCKER_CONTEXT && process.env.DOCKER_HOST ? ['--host', process.env.DOCKER_HOST] : context.name !== 'unknown' ? ['--context', context.name] : []
-    const command = `cd ${shellQuote(path)} && ${[bin, ...target, ...args].map(shellQuote).join(' ')}`
+    // A terminal can have different Compose exports; preserve missing variables as well as values.
+    const entries = Object.entries(environment ?? {})
+    const envArgs = environment ? ['env', ...entries.filter(([, value]) => value === undefined).flatMap(([key]) => ['-u', key]),
+      ...entries.filter(([, value]) => value !== undefined).map(([key, value]) => `${key}=${value}`)] : []
+    const command = `cd ${shellQuote(path)} && ${[...envArgs, bin, ...target, ...args].map(shellQuote).join(' ')}`
     const create = async (command: string) => {
       const { terminalId } = await orca.host.call('terminal.create', { workspaceId: workspace.id, title, command }) as { terminalId: string }
       await reveal(terminalId)
@@ -219,16 +244,15 @@ export default function activate(orca: OrcaWorkerApi): void {
     },
     'compose.profiles': async (input, signal) => {
       const { path } = await workspaceFor(input.path)
-      const options = await validateOptions(path, { files: input.files, profiles: [] })
-      const envFile = await composeEnvFile(path, options)
-      const result = await run(await docker(), [...composeArgs(options, [], envFile), 'config', '--profiles'], { cwd: path, timeoutMs: 20_000, signal })
-      return { profiles: lines(result.stdout) }
+      const options = await validateOptions(path, { files: input.files, profiles: input.profiles ?? [], ...(input.envFile ? { envFile: input.envFile } : {}), ...(input.profileMode ? { profileMode: input.profileMode } : {}) })
+      const model = await composeConfig(path, await docker(), true, options, signal)
+      return { profiles: model.profiles, runtime: model.runtime }
     },
     'compose.set': async (input, signal) => {
       const { path } = await workspaceFor(input.path)
       const options = await validateOptions(path, input.options)
       const model = await composeConfig(path, await docker(), true, options, signal)
-      if (options.profiles.some((profile) => !model.profiles.includes(profile))) throw invalid('Unknown Compose profile; choose one of the available profiles')
+      if (options.profileMode !== 'auto' && options.profiles.some((profile) => !model.profiles.includes(profile))) throw invalid('Unknown Compose profile; choose one of the available profiles')
       await orca.storage.set(keyFor('compose', path), options)
       configCache.delete(path)
       return { options }
@@ -236,8 +260,8 @@ export default function activate(orca: OrcaWorkerApi): void {
     'services.list': async (input, signal) => {
       const { path } = await workspaceFor(input.path)
       const bin = await docker()
-      const { project, rows, options, profiles } = await readProject(path, bin, input.fresh === true, signal)
-      return { project, rows, options, profiles, context: await dockerContext(bin, signal) }
+      const { project, rows, options, profiles, runtime } = await readProject(path, bin, input.fresh === true, signal)
+      return { project, rows, options, profiles, runtime, context: await dockerContext(bin, signal) }
     },
     'views.get': async (input) => {
       const { path } = await workspaceFor(input.path)
@@ -335,8 +359,8 @@ export default function activate(orca: OrcaWorkerApi): void {
         noForeign(model.foreign)
         const declared = model.config.services[service]
         if (!declared) throw invalid('Unknown Compose service')
-        const args = [...composeArgs(model.options, [...model.options.profiles, ...declared.profiles], model.envFile), 'up', '-d', ...(action === 'build' ? ['--build'] : []), service]
-        return { terminalId: await openTerminal(path, `${action === 'build' ? 'build' : 'up'} ${service}`, args, bin, { service }) }
+        const args = [...composeArgs(model.options, model.commandProfiles, model.envFile), '-p', model.project, 'up', '-d', ...(action === 'build' ? ['--build'] : []), service]
+        return { terminalId: await openTerminal(path, `${action === 'build' ? 'build' : 'up'} ${service}`, args, bin, { service }, model.controls) }
       }
       if (id === null) throw invalid('The service has no container')
       await operations.run(path, `${action} ${service}`, service, () => run(bin, [action, id], { timeoutMs: 60_000, signal }))
@@ -348,8 +372,9 @@ export default function activate(orca: OrcaWorkerApi): void {
       const bin = await docker()
       const model = await readProject(path, bin, true, signal)
       noForeign(model.foreign)
-      if (input.action === 'up') return { terminalId: await openTerminal(path, 'compose up', [...composeArgs(model.options, model.options.profiles, model.envFile), 'up', '-d'], bin, { service: null }) }
-      await operations.run(path, `compose ${input.action}`, null, () => run(bin, [...composeArgs(model.options, model.profiles, model.envFile), input.action], { cwd: path, timeoutMs: 115_000, signal }))
+      if (!model.runtime.enabledServices.length) throw invalid('No services are enabled; choose a profile before running project commands')
+      if (input.action === 'up') return { terminalId: await openTerminal(path, 'compose up', [...composeArgs(model.options, model.commandProfiles, model.envFile), '-p', model.project, 'up', '-d'], bin, { service: null }, model.controls) }
+      await operations.run(path, `compose ${input.action}`, null, () => run(bin, [...composeArgs(model.options, model.commandProfiles, model.envFile), '-p', model.project, input.action], { cwd: path, timeoutMs: 115_000, signal, env: model.controls }))
       return { terminalId: null }
     },
     'container.shell': async (input, signal) => {

@@ -18,10 +18,12 @@ test('finds nested configs, variants and custom YAML/JSON names without unrelate
     'infra/workflow.yml': 'jobs:\n  test:\n    services: {}',
     'node_modules/pkg/compose.yml': 'services: {}',
     '.git/compose.yml': 'services: {}',
-    'vendor/compose.yml': 'services: {}'
+    'vendor/compose.yml': 'services: {}',
+    '.env': 'SECRET=not-returned',
+    '.docker/profiles/.env.dev': 'COMPOSE_PROFILES=tools'
   }
   await Promise.all(Object.entries(files).map(([name, content]) => writeFile(join(root, name), content)))
-  assert.deepEqual(await discoverComposeFiles(root), { files: ['.docker/profiles/tools.yaml', 'compose.yaml', 'docker/local/docker-compose.dev.yml', 'infra/include.yml', 'infra/stack.yml'], truncated: false })
+  assert.deepEqual(await discoverComposeFiles(root), { files: ['.docker/profiles/tools.yaml', 'compose.yaml', 'docker/local/docker-compose.dev.yml', 'infra/include.yml', 'infra/stack.yml'], envFiles: ['.docker/profiles/.env.dev', '.env'], truncated: false })
 })
 
 test('does not follow symlinks, reports scan limits and supports cancellation', async (t) => {

@@ -12,6 +12,7 @@ export function composeArgs(options: ComposeOptions, profiles = options.profiles
 /** Older Compose versions switch dotenv discovery to the first -f directory. Keep workspace
  * variables when selecting custom files, while preserving that file's build/bind path base. */
 export async function composeEnvFile(path: string, options: ComposeOptions): Promise<string | undefined> {
+  if (options.envFile) return options.envFile
   if (!options.files.length || process.env.COMPOSE_ENV_FILES || /^(true|1)$/i.test(process.env.COMPOSE_DISABLE_ENV_FILE ?? '')) return undefined
   return await stat(join(path, '.env')).then((entry) => entry.isFile() ? '.env' : undefined, () => undefined)
 }
@@ -21,6 +22,7 @@ export async function validateOptions(path: string, value: ComposeOptions): Prom
     throw fail('invalid_params', 'Invalid Compose settings')
   }
   const root = await realpath(path)
+  if (value.profileMode !== undefined && !['auto', 'manual'].includes(value.profileMode)) throw fail('invalid_params', 'Invalid profile mode')
   const files: string[] = []
   for (const file of value.files) {
     if (typeof file !== 'string' || !file || file.length > 1024 || /[\x00-\x1f]/.test(file) || isAbsolute(file) || file.startsWith('-')) {
@@ -39,5 +41,10 @@ export async function validateOptions(path: string, value: ComposeOptions): Prom
     }
     return profile
   })
-  return { files: [...new Set(files)], profiles: [...new Set(profiles)] }
+  let envFile: string | undefined
+  if (value.envFile !== undefined && value.envFile !== '') {
+    const checked = await validateOptions(path, { files: [value.envFile], profiles: [] })
+    envFile = checked.files[0]
+  }
+  return { files: [...new Set(files)], profiles: [...new Set(profiles)], ...(envFile ? { envFile } : {}), ...(value.profileMode ? { profileMode: value.profileMode } : {}) }
 }

@@ -24,28 +24,35 @@ async function composeContent(path: string): Promise<boolean> {
 }
 
 /** A bounded breadth-first scan; symlinks are not followed and paths remain workspace-relative. */
-export async function discoverComposeFiles(path: string, limit = 200, signal?: AbortSignal): Promise<{ files: string[]; truncated: boolean }> {
+export async function discoverComposeFiles(path: string, limit = 200, signal?: AbortSignal): Promise<{ files: string[]; envFiles: string[]; truncated: boolean }> {
   const files: string[] = []
+  const envFiles: string[] = []
+  const answer = (truncated: boolean) => ({ files: files.sort(), envFiles: envFiles.sort(), truncated })
   const directories = ['']
   let entries = 0, visited = 0
   while (directories.length) {
     signal?.throwIfAborted()
-    if (++visited > MAX_DIRECTORIES) return { files: files.sort(), truncated: true }
+    if (++visited > MAX_DIRECTORIES) return answer(true)
     const current = directories.shift()!
     const directory = await opendir(join(path, current)).catch(() => null)
     if (!directory) continue
     for await (const entry of directory) {
       signal?.throwIfAborted()
-      if (++entries > MAX_ENTRIES) return { files: files.sort(), truncated: true }
+      if (++entries > MAX_ENTRIES) return answer(true)
       const relative = current ? `${current}/${entry.name}` : entry.name
       if (relative.length > 1024 || /[\x00-\x1f]/.test(relative) || relative.startsWith('-')) continue
       if (entry.isDirectory() && !SKIP.has(entry.name)) directories.push(relative)
-      if (!entry.isFile() || !/\.ya?ml$/i.test(entry.name)) continue
+      if (!entry.isFile()) continue
+      if (/^(?:\.env(?:[._-].+)?|.+\.env(?:[._-].+)?)$/i.test(entry.name)) {
+        if (envFiles.length === 200) return answer(true)
+        envFiles.push(relative)
+      }
+      if (!/\.ya?ml$/i.test(entry.name)) continue
       if (!COMPOSE_NAME.test(entry.name) && !await composeContent(join(path, relative))) continue
-      if (files.length === limit) return { files: files.sort(), truncated: true }
+      if (files.length === limit) return answer(true)
       files.push(relative)
-      if (limit === 1) return { files, truncated: true }
+      if (limit === 1) return answer(true)
     }
   }
-  return { files: files.sort(), truncated: false }
+  return answer(false)
 }

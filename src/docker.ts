@@ -68,7 +68,7 @@ function childEnv(binary: string): NodeJS.ProcessEnv {
   return { ...process.env, PATH: [...new Set(dirs)].join(delimiter) }
 }
 
-export type RunOptions = { cwd?: string; timeoutMs: number; signal?: AbortSignal }
+export type RunOptions = { cwd?: string; timeoutMs: number; signal?: AbortSignal; env?: Record<string, string | undefined> }
 
 /** Long-lived event subscriptions have a separate, explicitly bounded lifecycle. */
 export function spawnDocker(binary: string, args: string[]) {
@@ -79,13 +79,13 @@ export function spawnDocker(binary: string, args: string[]) {
 export function run(
   binary: string,
   args: string[],
-  { cwd, timeoutMs, signal }: RunOptions
+  { cwd, timeoutMs, signal, env }: RunOptions
 ): Promise<{ stdout: string; stderr: string }> {
   return limited(() => new Promise((resolve, reject) => {
     execFile(
       binary,
       args,
-      { cwd, env: childEnv(binary), timeout: timeoutMs, signal, maxBuffer: 8 * 1024 * 1024, encoding: 'utf8' },
+      { cwd, env: { ...childEnv(binary), ...env }, timeout: timeoutMs, signal, maxBuffer: 8 * 1024 * 1024, encoding: 'utf8' },
       (error, stdout, stderr) => {
         if (!error) return resolve({ stdout, stderr })
         const err = error as NodeJS.ErrnoException & { killed?: boolean }

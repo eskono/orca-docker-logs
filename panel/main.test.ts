@@ -185,6 +185,7 @@ test('Compose settings submit files/profiles and service-list height is keyboard
   ui.focus(A); await settle()
   ui.element<HTMLTextAreaElement>('compose-files').value = 'infra/stack.yml\ninfra/dev.yml'
   ui.element<HTMLInputElement>('compose-profiles').value = 'web, tools'
+  ui.element<HTMLInputElement>('compose-profiles').dispatchEvent(new ui.window.Event('input'))
   ui.element<HTMLFormElement>('compose-form').dispatchEvent(new ui.window.Event('submit', { cancelable: true })); await settle()
   assert.deepEqual(options, { files: ['infra/stack.yml', 'infra/dev.yml'], profiles: ['web', 'tools'] })
   const splitter = ui.element('services-resize')
@@ -360,4 +361,45 @@ test('late saved Compose settings do not overwrite a config picked by the user',
   check.checked = true; check.dispatchEvent(new ui.window.Event('change')); await settle()
   saved.resolve({ options: { files: ['compose.yaml'], profiles: [] } }); await settle()
   assert.equal(ui.element<HTMLTextAreaElement>('compose-files').value, 'docker/dev.yml')
+})
+
+test('shows environment profiles and actual running services independently, and can select base-only mode', async (t) => {
+  const runtime = { environmentProfiles: ['dev'], effectiveProfiles: ['dev'], profileSource: 'environment', envFile: '.env', enabledServices: ['app'], runningServices: ['app', 'debug'], outsideSelection: ['debug'] }
+  let saved: any
+  const ui = await panel((name, input) => {
+    if (name === 'compose.discover') return { files: ['compose.yaml'], envFiles: ['.env', '.docker/.env.prod'], truncated: false }
+    if (name === 'compose.profiles') return { profiles: ['dev', 'production'], runtime: { ...runtime, effectiveProfiles: input.profileMode === 'manual' ? input.profiles : input.envFile ? ['production'] : ['dev'], profileSource: input.profileMode === 'manual' ? 'selection' : 'environment' } }
+    if (name === 'services.list') return { project: 'A', rows: [row(A.path)], options: { files: [], profiles: [] }, profiles: ['dev'], runtime, context: { name: 'default', endpoint: '', remote: false } }
+    if (name === 'compose.set') { saved = input.options; return { options: saved } }
+  })
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  assert.match(ui.element('compose-runtime').textContent!, /environment.*dev/)
+  assert.match(ui.element('compose-runtime').textContent!, /Running outside selection: debug/)
+  const dev = ui.window.document.querySelector<HTMLInputElement>('[aria-label="Enable Compose profile dev"]')!
+  assert.equal(dev.checked, true)
+  dev.checked = false; dev.dispatchEvent(new ui.window.Event('change')); await settle()
+  assert.equal(ui.element<HTMLSelectElement>('compose-profile-mode').value, 'manual')
+  assert.match(ui.element('compose-profile-status').textContent!, /Effective profiles \(selection\): none/)
+  const envFile = ui.element<HTMLInputElement>('compose-env-file')
+  assert.equal(ui.element('compose-env-files').querySelectorAll('option').length, 2)
+  envFile.value = '.docker/.env.prod'; envFile.dispatchEvent(new ui.window.Event('change')); await settle()
+  ui.element<HTMLFormElement>('compose-form').dispatchEvent(new ui.window.Event('submit', { cancelable: true })); await settle()
+  assert.deepEqual(saved, { files: [], profiles: [], profileMode: 'manual', envFile: '.docker/.env.prod' })
+})
+
+test('an old env-file preview cannot change the profile selection for a newer env file', async (t) => {
+  const pending: ReturnType<typeof deferred>[] = []
+  const ui = await panel((name) => { if (name === 'compose.profiles') { const result = deferred(); pending.push(result); return result.promise } })
+  t.after(() => ui.dom.window.close())
+  ui.focus(A); await settle()
+  const env = ui.element<HTMLInputElement>('compose-env-file')
+  env.value = '.env.dev'; env.dispatchEvent(new ui.window.Event('change')); await settle()
+  env.value = '.env.prod'; env.dispatchEvent(new ui.window.Event('change')); await settle()
+  const runtime = (profile: string) => ({ environmentProfiles: [profile], effectiveProfiles: [profile], profileSource: 'environment', envFile: '.env.' + profile, enabledServices: ['app'], runningServices: [], outsideSelection: [] })
+  pending[2].resolve({ profiles: ['production'], runtime: runtime('production') }); await settle()
+  pending[1].resolve({ profiles: ['dev'], runtime: runtime('dev') }); pending[0].resolve({ profiles: ['base'], runtime: runtime('base') }); await settle()
+  assert.match(ui.element('compose-profile-status').textContent!, /production/)
+  assert.doesNotMatch(ui.element('compose-profile-status').textContent!, /\.env.dev|\.env.base/)
+  assert.equal(ui.window.document.querySelector<HTMLInputElement>('[aria-label="Enable Compose profile production"]')!.checked, true)
 })

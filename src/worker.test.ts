@@ -40,7 +40,7 @@ here=$(dirname "$0")
 echo "$(pwd)|$*" >> "$here/calls.log"
 case "$*" in
   *"config --profiles") echo web ;;
-  *"config --format json") cat "$here/config.json" ;;
+  *"config --format json") exec "${process.execPath}" "$here/render-config.cjs" "$@" ;;
   "ps -aq --no-trunc --filter label=com.docker.compose.project=proj") printf '${APP}\\n${WORKER}\\n' ;;
   "inspect ${APP} ${WORKER}") cat "$here/inspect.json" ;;
   "logs "*"${APP}")
@@ -57,7 +57,7 @@ case "$*" in
   "context inspect default --format {{json .Endpoints.docker.Host}}") echo '\"unix:///var/run/docker.sock\"' ;;
   stats*) printf '{"ID":"${APP}","CPUPerc":"1.50%%","MemUsage":"10MiB / 1GiB","MemPerc":"0.98%%"}\\n' ;;
   "start "*|"stop "*|"restart "*) echo "$2" ;;
-  "compose --profile web restart"|"compose --profile web down") ;;
+  "compose --profile orca_base_only -p proj restart"|"compose --profile orca_base_only -p proj down"|"compose --profile web -p proj restart"|"compose --profile web -p proj down") ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac
 `
@@ -78,6 +78,24 @@ async function setup() {
     writeFile(join(project, 'compose.yaml'), 'services: {}\n'),
     writeFile(join(root, 'config.json'), JSON.stringify(CONFIG).replace('__PROJECT__', project)),
     writeFile(join(root, 'inspect.json'), JSON.stringify(INSPECT).replaceAll('__PROJECT__', project)),
+    writeFile(join(root, 'render-config.cjs'), `const fs = require('node:fs'); const path = require('node:path');
+const args = process.argv.slice(2);
+let config = JSON.parse(fs.readFileSync(path.join(__dirname, 'config.json'), 'utf8'));
+const probe = args.find((arg) => arg.endsWith('/probe.json'));
+if (probe) {
+  const document = JSON.parse(fs.readFileSync(probe, 'utf8'));
+  const metadata = fs.existsSync(path.join(__dirname, 'environment.json')) ? JSON.parse(fs.readFileSync(path.join(__dirname, 'environment.json'), 'utf8')) : {};
+  for (const service of Object.values(document.services)) for (const [key, expression] of Object.entries(service.environment)) {
+    const missing = expression.slice(expression.indexOf('-') + 1, -1);
+    service.environment[key] = process.env[key] ?? metadata[key] ?? missing;
+  }
+  Object.assign(config.services, document.services);
+}
+const profiles = args.flatMap((arg, index) => arg === '--profile' ? [args[index + 1]] : []);
+const active = profiles.length ? profiles : (process.env.COMPOSE_PROFILES || '').split(',');
+if (!active.includes('*')) config.services = Object.fromEntries(Object.entries(config.services).filter(([, service]) => !service.profiles?.length || service.profiles.some((profile) => active.includes(profile))));
+process.stdout.write(JSON.stringify(config));
+`),
     writeFile(docker, FAKE_DOCKER)
   ])
   await chmod(docker, 0o755)
@@ -135,8 +153,8 @@ test('lists every profile’s services with container state, ports and build fla
     ]
   )
   const log = await calls()
-  assert.ok(log.includes(`${project}|compose config --profiles`))
-  assert.ok(log.includes(`${project}|compose --profile web config --format json`))
+  assert.ok(log.includes(`${project}|compose --profile * config --format json`))
+  assert.ok(log.includes(`${project}|compose --profile * config --format json`))
   await worker.deactivate()
 })
 
@@ -209,9 +227,9 @@ test('acts on containers in the background and opens terminals for long compose 
   for (const terminal of terminals.slice(0, 3)) {
     assert.match(terminal.command, /^sh -c /)
     assert.match(terminal.command, /ORCA_DOCKER_DONE_/)
-    assert.ok(terminal.command.includes(`cd ${project} && ${docker} --context default compose`))
+    assert.ok(terminal.command.includes(` ${docker} --context default compose`))
   }
-  assert.ok(terminals[0].command.includes('--profile web up -d caddy'))
+  assert.ok(terminals[0].command.includes('--profile orca_base_only -p proj up -d caddy'))
   assert.ok(terminals[1].command.includes('up -d --build app'))
   assert.equal(terminals[3].command, `cd ${project} && ${docker} --context default exec -it ${APP} sh -c 'command -v bash >/dev/null 2>&1 && exec bash || exec sh'`)
 
@@ -220,7 +238,7 @@ test('acts on containers in the background and opens terminals for long compose 
   assert.deepEqual(await orcaCalls(), Array(4).fill('terminal switch --terminal term_1 --json'))
 
   assert.deepEqual(await worker.request('project.action', { path: project, action: 'down' }), { terminalId: null })
-  assert.equal((await args()).at(-1), 'compose --profile web down')
+  assert.equal((await args()).at(-1), 'compose --profile orca_base_only -p proj down')
   await worker.deactivate()
 })
 
@@ -364,9 +382,9 @@ test('persists Compose files/profiles per workspace and applies them to commands
     assert.deepEqual(await worker.request('compose.get', { path: project }), { options })
     await worker.request('project.action', { path: project, action: 'up' })
     const call = host.callsOf('terminal.create').at(-1) as { command: string }
-    assert.ok(call.command.includes(`cd ${project} && ${docker} --context default compose -f infra/stack.yml --profile web up -d`))
+    assert.ok(call.command.includes(`${docker} --context default compose -f infra/stack.yml --profile web -p proj up -d`))
     await worker.request('services.list', { path: project, fresh: true })
-    assert.ok((await args()).includes('compose -f infra/stack.yml --profile web config --format json'))
+    assert.ok((await args()).includes('compose -f infra/stack.yml --profile * config --format json'))
     await assert.rejects(worker.request('compose.set', { path: project, options: { files: ['../inspect.json'], profiles: [] } }), { code: 'invalid_params' })
     await symlink(join(project, '..', 'config.json'), join(project, 'outside.yaml'))
     await assert.rejects(worker.request('compose.set', { path: project, options: { files: ['outside.yaml'], profiles: [] } }), { code: 'invalid_params' })
@@ -411,8 +429,8 @@ test('custom nested Compose files keep the workspace dotenv for config and termi
     await writeFile(join(project, '.env'), 'COMPOSE_PROJECT_NAME=proj\n')
     await worker.request('compose.set', { path: project, options: { files: ['infra/stack.yml'], profiles: [] } })
     await worker.request('project.action', { path: project, action: 'up' })
-    assert.ok((await args()).includes('compose --env-file .env -f infra/stack.yml --profile web config --format json'))
-    assert.match((host.callsOf('terminal.create').at(-1) as { command: string }).command, /compose --env-file .env -f infra\/stack.yml up -d/)
+    assert.ok((await args()).includes('compose --env-file .env -f infra/stack.yml --profile * config --format json'))
+    assert.match((host.callsOf('terminal.create').at(-1) as { command: string }).command, /compose --env-file .env -f infra\/stack.yml --profile orca_base_only -p proj up -d/)
   } finally { await worker.deactivate() }
 })
 
@@ -466,18 +484,73 @@ test('lists projects with only nested configs and previews their profiles withou
   await writeFile(join(plain, '.docker', 'local', 'dev.yml'), 'services:\n  app:\n    profiles: [web]\n')
   const workspaces = await worker.request('workspaces.list', { context: { displayName: 'feature', branch: 'feature', terminals: [] } })
   assert.ok(workspaces.workspaces.some((workspace: { path: string }) => workspace.path === plain))
-  assert.deepEqual(await worker.request('compose.discover', { path: plain }), { files: ['.docker/local/dev.yml'], truncated: false })
+  assert.deepEqual(await worker.request('compose.discover', { path: plain }), { files: ['.docker/local/dev.yml'], envFiles: [], truncated: false })
   await mkdir(join(project, 'docker', 'local'), { recursive: true })
   await writeFile(join(project, 'docker/local/compose.yaml'), 'services: {}')
   await writeFile(join(project, 'docker/local/compose.override.yaml'), 'services: {}')
   const files = ['docker/local/compose.yaml', 'docker/local/compose.override.yaml']
-  assert.deepEqual(await worker.request('compose.profiles', { path: project, files }), { profiles: ['web'] })
-  assert.ok((await args()).includes('compose -f docker/local/compose.yaml -f docker/local/compose.override.yaml config --profiles'))
+  assert.deepEqual((await worker.request('compose.profiles', { path: project, files })).profiles, ['web'])
+  assert.ok((await args()).some((arg) => arg.startsWith('compose -f docker/local/compose.yaml -f docker/local/compose.override.yaml') && arg.endsWith('config --format json')))
   assert.deepEqual(await worker.request('compose.get', { path: project }), { options: { files: [], profiles: [] } })
   await worker.request('compose.set', { path: project, options: { files, profiles: ['web'] } })
   await worker.request('project.action', { path: project, action: 'up' })
   const command = (host.callsOf('terminal.create').at(-1) as { command: string }).command
-  assert.ok(command.includes('compose -f docker/local/compose.yaml -f docker/local/compose.override.yaml --profile web up -d'))
+  assert.ok(command.includes('compose -f docker/local/compose.yaml -f docker/local/compose.override.yaml --profile web -p proj up -d'))
   await assert.rejects(worker.request('compose.discover', { path: '/foreign' }), { code: 'not_permitted' })
   await assert.rejects(worker.request('compose.profiles', { path: project, files: ['../inspect.json'] }), { code: 'invalid_params' })
+})
+
+test('inherits profiles from Compose environment, separates running services, and scopes all project commands', async (t) => {
+  const { worker, host, root, project, args } = await setup()
+  t.after(() => worker.deactivate())
+  await writeFile(join(root, 'environment.json'), JSON.stringify({ COMPOSE_PROFILES: 'web', PRIVATE_VALUE: 'never-send-this' }))
+  const config = { ...CONFIG, services: { ...CONFIG.services, worker: { image: 'busybox', profiles: ['background'] } } }
+  await writeFile(join(root, 'config.json'), JSON.stringify(config).replace('__PROJECT__', project))
+  const inspected = structuredClone(INSPECT)
+  inspected[1].State.Status = 'running'
+  await writeFile(join(root, 'inspect.json'), JSON.stringify(inspected).replaceAll('__PROJECT__', project))
+  const model = await worker.request('services.list', { path: project, fresh: true })
+  assert.deepEqual(model.runtime.environmentProfiles, ['web'])
+  assert.deepEqual(model.runtime.effectiveProfiles, ['web'])
+  assert.deepEqual(model.runtime.runningServices, ['app', 'worker'])
+  assert.deepEqual(model.runtime.outsideSelection, ['worker'])
+  assert.equal(JSON.stringify(model).includes('never-send-this'), false)
+  await worker.request('project.action', { path: project, action: 'up' })
+  const terminal = (host.callsOf('terminal.create').at(-1) as { command: string }).command
+  assert.ok(terminal.includes('--profile web -p proj up -d'))
+  assert.ok(terminal.includes('-u COMPOSE_PROFILES'))
+  await worker.request('project.action', { path: project, action: 'restart' })
+  await worker.request('project.action', { path: project, action: 'down' })
+  assert.ok((await args()).includes('compose --profile web -p proj restart'))
+  assert.ok((await args()).includes('compose --profile web -p proj down'))
+})
+
+test('explicit env files and manual base-only profiles survive storage without changing root defaults', async (t) => {
+  const { worker, host, project, root, args } = await setup()
+  t.after(() => worker.deactivate())
+  await writeFile(join(project, '.env.prod'), 'COMPOSE_PROFILES=web\n')
+  await writeFile(join(root, 'environment.json'), JSON.stringify({ COMPOSE_PROFILES: 'web' }))
+  const options = { files: ['compose.yaml'], profiles: [], envFile: '.env.prod', profileMode: 'manual' }
+  await worker.request('compose.set', { path: project, options })
+  assert.deepEqual((await worker.request('compose.get', { path: project })).options, options)
+  const model = await worker.request('services.list', { path: project, fresh: true })
+  assert.deepEqual(model.runtime.environmentProfiles, ['web'])
+  assert.deepEqual(model.runtime.effectiveProfiles, [])
+  assert.deepEqual(model.runtime.enabledServices, ['app', 'worker'])
+  await worker.request('project.action', { path: project, action: 'up' })
+  const terminal = (host.callsOf('terminal.create').at(-1) as { command: string }).command
+  assert.ok(terminal.includes('-u COMPOSE_PROFILES'))
+  assert.ok(terminal.includes('--env-file .env.prod -f compose.yaml --profile orca_base_only -p proj up -d'))
+  assert.equal((await args()).some((arg) => arg.includes('--env-file .env.prod -f compose.yaml --profile web config')), false)
+})
+
+test('an empty manual selection cannot run project commands when all services need profiles', async (t) => {
+  const { worker, project, root } = await setup()
+  t.after(() => worker.deactivate())
+  await writeFile(join(root, 'config.json'), JSON.stringify({ name: 'proj', services: { app: { image: 'busybox', profiles: ['dev'] } } }))
+  await worker.request('compose.set', { path: project, options: { files: [], profiles: [], profileMode: 'manual' } })
+  const model = await worker.request('services.list', { path: project, fresh: true })
+  assert.deepEqual(model.runtime.enabledServices, [])
+  await assert.rejects(worker.request('project.action', { path: project, action: 'up' }), { code: 'invalid_params' })
+  await assert.rejects(worker.request('project.action', { path: project, action: 'down' }), { code: 'invalid_params' })
 })

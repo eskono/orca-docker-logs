@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { findDocker, run } from '../src/docker'
 import { timeKey } from '../src/log-time'
+import { checkRootAndNestedEnv } from './compose-env-smoke'
 import { hasComposeFile } from '../src/workspaces'
 import { mockHost, mountWorker } from '../test/host'
 import * as main from '../src/worker'
@@ -13,6 +14,7 @@ import type { LogLine, ServiceRow } from '../src/protocol'
 const bin = await findDocker('')
 const docker = (args: string[], cwd?: string) => run(bin, args, { cwd, timeoutMs: 45_000 })
 await docker(['info', '--format', '{{.ServerVersion}}'])
+await checkRootAndNestedEnv(bin)
 const installed = (await docker(['image', 'ls', '--filter', 'dangling=false', '--format', '{{json .}}'])).stdout.trim().split('\n').filter(Boolean).map((value) => JSON.parse(value) as { Repository: string; Tag: string })
 const requested = process.env.DOCKER_LOGS_TEST_IMAGE
 const cached = installed.find((image) => /(?:^|\/)(alpine|busybox|python|node|debian|ubuntu|postgres|redis|nginx)$/.test(image.Repository) && image.Tag !== '<none>')
@@ -29,25 +31,34 @@ try {
   await writeFile(join(root, 'code', 'main.py'), 'print("smoke fixture")\n')
   await writeFile(join(root, '.env'), `COMPOSE_FILE=infra/stack.yml\nCOMPOSE_PROJECT_NAME=${project}\n`)
   const service = {
-    image, entrypoint: ['/bin/sh', '-c'], command: ['i=0; while [ "$$i" -lt 120 ]; do echo "INFO tick $$i"; echo "ERROR fixture $$i" >&2; i=$$((i + 1)); sleep 1; done'],
+    image, pull_policy: 'never', entrypoint: ['/bin/sh', '-c'], command: ['i=0; while [ "$$i" -lt 120 ]; do echo "INFO tick $$i"; echo "ERROR fixture $$i" >&2; i=$$((i + 1)); sleep 1; done'],
     network_mode: 'none', read_only: true, cap_drop: ['ALL']
   }
   // JSON is a Compose-supported YAML subset. A nested file exercises project working_dir labels.
   await writeFile(join(root, 'infra', 'stack.yml'), JSON.stringify({ services: {
     app: { ...service, volumes: ['../code:/app:ro'] },
     db: service,
-    tools: { ...service, profiles: ['tools'] }
+    tools: { ...service, profiles: ['tools'] },
+    prod: { ...service, profiles: ['production'] }
   } }))
   assert.equal(await hasComposeFile(root), true)
   await docker(['compose', 'up', '-d', '--pull', 'never'], root)
+  let terminalOutput: string[] = []
   const host = mockHost({ settings: { dockerPath: bin }, results: {
+    'terminal.create': async ({ command }: { command: string }) => {
+      const result = await run('/bin/sh', ['-c', command], { cwd: root, timeoutMs: 45_000, env: { COMPOSE_FILE: 'missing.yml', COMPOSE_PROFILES: 'production', COMPOSE_PROJECT_NAME: 'wrong-project', COMPOSE_ENV_FILES: 'missing.env', COMPOSE_DISABLE_ENV_FILE: 'true', COMPOSE_REMOVE_ORPHANS: 'true' } })
+      terminalOutput = (result.stdout + result.stderr).split('\n')
+      return { terminalId: 'smoke-operation-terminal' }
+    },
+    'terminal.read': () => ({ lines: terminalOutput, truncated: false }),
     'workspace.list': { workspaces: [{ id: 'smoke', name: 'smoke', path: root, branch: 'main', hostId: 'local' }] }
   } })
   worker = await mountWorker(main, { host })
   const discovered = await worker.request('compose.discover', { path: root })
   assert.ok(discovered.files.includes('infra/stack.yml'))
   const preview = await worker.request('compose.profiles', { path: root, files: ['infra/stack.yml'] })
-  assert.deepEqual(preview.profiles, ['tools'])
+  assert.deepEqual([...preview.profiles].sort(), ['production', 'tools'])
+  assert.deepEqual(preview.runtime.effectiveProfiles, [])
   assert.deepEqual((await worker.request('compose.get', { path: root })).options, { files: [], profiles: [] })
   const model = await worker.request('services.list', { path: root })
   const app = model.rows.find((row: ServiceRow) => row.service === 'app') as ServiceRow
@@ -98,7 +109,33 @@ try {
   foreignId = (await docker(['run', '-d', '--pull', 'never', '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--name', `${project}-foreign`, '--entrypoint', '/bin/sh', image, '-c', 'sleep 120'])).stdout.trim()
   await assert.rejects(worker.request('service.action', { path: root, service: 'app', containerId: foreignId, action: 'stop' }), { code: 'not_permitted' })
   assert.equal((await docker(['inspect', '--format', '{{.State.Running}}', foreignId])).stdout.trim(), 'true')
-  console.log('Live Docker smoke passed: nested config discovery, profile preview, COMPOSE_FILE, ownership, profiles, stdout/stderr logs, Clear, cursors, stats, bind-mount source mapping, operation completion, event streaming, bounded event logs, saved views and restart.')
+  await writeFile(join(root, '.env'), `COMPOSE_FILE=infra/stack.yml\nCOMPOSE_PROJECT_NAME=${project}\nSTAGE=tools\nCOMPOSE_PROFILES="\${STAGE}"\nPRIVATE_VALUE=not-for-the-panel\n`)
+  await worker.request('compose.set', { path: root, options: { files: [], profiles: [] } })
+  const inherited = await worker.request('services.list', { path: root, fresh: true })
+  assert.deepEqual(inherited.runtime.environmentProfiles, ['tools'])
+  assert.deepEqual(inherited.runtime.effectiveProfiles, ['tools'])
+  assert.equal(JSON.stringify(inherited).includes('not-for-the-panel'), false)
+  await worker.request('project.action', { path: root, action: 'up' })
+  assert.equal((await worker.request('operations.list', { path: root })).operations[0].status, 'succeeded')
+  const tools = (await worker.request('services.list', { path: root, fresh: true })).rows.find((row: ServiceRow) => row.service === 'tools') as ServiceRow
+  assert.equal(tools.state, 'running')
+  await writeFile(join(root, 'infra', '.env.production'), `COMPOSE_PROJECT_NAME=${project}\nCOMPOSE_PROFILES=production\nPRIVATE_VALUE=still-not-for-the-panel\n`)
+  await worker.request('compose.set', { path: root, options: { files: ['infra/stack.yml'], envFile: 'infra/.env.production', profiles: [] } })
+  const production = await worker.request('services.list', { path: root, fresh: true })
+  assert.deepEqual(production.runtime.effectiveProfiles, ['production'])
+  assert.deepEqual(production.runtime.outsideSelection, ['tools'])
+  assert.equal(JSON.stringify(production).includes('still-not-for-the-panel'), false)
+  await worker.request('project.action', { path: root, action: 'restart' })
+  const toolsAfterRestart = (await worker.request('services.list', { path: root, fresh: true })).rows.find((row: ServiceRow) => row.service === 'tools') as ServiceRow
+  assert.equal(toolsAfterRestart.startedAt, tools.startedAt)
+  await worker.request('compose.set', { path: root, options: { files: ['infra/stack.yml'], envFile: 'infra/.env.production', profileMode: 'manual', profiles: [] } })
+  const base = await worker.request('services.list', { path: root, fresh: true })
+  assert.deepEqual(base.runtime.environmentProfiles, ['production'])
+  assert.deepEqual(base.runtime.effectiveProfiles, [])
+  assert.deepEqual(base.runtime.enabledServices.sort(), ['app', 'db'])
+  await worker.request('project.action', { path: root, action: 'down' })
+  assert.equal((await docker(['inspect', '--format', '{{.State.Running}}', tools.containerId!])).stdout.trim(), 'true')
+  console.log('Live Docker smoke passed: root/nested dotenv compatibility, profile inheritance and overrides, scoped project commands, terminal environment isolation, ownership, stdout/stderr logs, Clear, cursors, stats, bind-mount source mapping, operation completion, event streaming, bounded event logs, saved views and restart.')
 } catch (error) {
   const logs = await docker(['compose', '-p', project, '-f', 'infra/stack.yml', 'logs', '--no-color', '--tail', '10'], root).catch(() => null)
   if (logs) console.error(logs.stdout + logs.stderr)

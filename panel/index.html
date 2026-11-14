@@ -247,6 +247,7 @@
         <button id="project-down" title="docker compose down: stops and removes the containers" disabled>Down</button>
       </div>
       <div id="docker-context" class="docker-context">Docker: loading…</div>
+      <div id="compose-runtime" class="hint" style="white-space:pre-wrap" aria-live="polite"></div>
       <details id="compose-settings" class="compose-settings">
         <summary>Compose settings</summary>
         <form id="compose-form">
@@ -260,12 +261,22 @@
             <textarea id="compose-files" placeholder="Automatic discovery, or e.g. infra/stack.yml"></textarea>
           </label>
           <span class="hint">Select the base config first, then overrides. The order above is used by Compose. Leave empty for automatic discovery.</span>
+          <label>Environment file
+            <input id="compose-env-file" list="compose-env-files" placeholder="Automatic .env, or e.g. .docker/.env.dev" />
+            <datalist id="compose-env-files"></datalist>
+          </label>
+          <label>Profiles for project commands
+            <select id="compose-profile-mode" aria-label="Compose profile source">
+              <option value="auto">From environment (.env / COMPOSE_PROFILES)</option>
+              <option value="manual">Choose profiles</option>
+            </select>
+          </label>
           <fieldset>
             <legend>Profiles from selected configs</legend>
             <div id="compose-profile-choices" class="compose-choices"></div>
             <span id="compose-profile-status" class="hint" role="status"></span>
           </fieldset>
-          <label>Profiles for Up (comma-separated)
+          <label>Selected profiles (comma-separated; empty = base services only in Choose mode)
             <input id="compose-profiles" placeholder="Compose defaults, or e.g. web, tools" />
           </label>
           <div class="row"><button id="compose-apply" type="submit" disabled>Apply</button><button id="compose-defaults" type="button">Use defaults</button></div>
